@@ -261,23 +261,36 @@ public sealed class Worker
         }
     }
 
-    // ==== 簡易CPUモニタ（Linux: /proc/stat、他OS: 測定不可として待機のみ） ====
+    // ==== クロスプラットフォームCPUモニタ（Linux: /proc/stat, Windows: GetSystemTimes） ====
     private sealed class CpuMonitor
     {
-        private long _prevIdle = -1, _prevTotal = -1;
-        public bool CanMeasureSystem => RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+        public bool CanMeasure =>
+            RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
+        public bool CanMeasureSystem => CanMeasure;
+
+        // 0.0〜1.0（システム全体のCPU使用率）
         public async Task<double> GetSystemCpuUsageAsync(CancellationToken ct)
         {
-            if (!CanMeasureSystem) return 0.0;
-            // /proc/stat の1行目: cpu  user nice system idle iowait irq softirq steal guest guest_nice
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                return await GetCpuLinuxAsync(ct);
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                return await GetCpuWindowsAsync(ct);
+
+            // macOS等はここでは未対応（必要なら後述の代替案へ）
+            return 0.0;
+        }
+
+        // --- Linux: /proc/stat を2回読む ---
+        private static async Task<double> GetCpuLinuxAsync(CancellationToken ct)
+        {
             static (long idle, long total) Read()
             {
                 using var sr = new StreamReader("/proc/stat");
                 var line = sr.ReadLine();
                 if (line == null || !line.StartsWith("cpu ")) return (0, 0);
                 var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                // user nice system idle iowait irq softirq steal ...
                 long user = long.Parse(parts[1]);
                 long nice = long.Parse(parts[2]);
                 long system = long.Parse(parts[3]);
@@ -297,8 +310,45 @@ public sealed class Worker
             long idle = idle2 - idle1;
             long total = total2 - total1;
             if (total <= 0) return 0.0;
-            double busy = 1.0 - (double)idle / total; // 0..1
+            double busy = 1.0 - (double)idle / total;
             return Math.Clamp(busy, 0.0, 1.0);
         }
+
+        // --- Windows: GetSystemTimesを2回読む ---
+        private static async Task<double> GetCpuWindowsAsync(CancellationToken ct)
+        {
+            static (ulong idle, ulong kernel, ulong user) Read()
+            {
+                GetSystemTimes(out var idleFt, out var kernelFt, out var userFt);
+                return (ToULong(idleFt), ToULong(kernelFt), ToULong(userFt));
+            }
+
+            var (idle1, kern1, user1) = Read();
+            await Task.Delay(80, ct);
+            var (idle2, kern2, user2) = Read();
+
+            // kernel には idle を含むことに注意
+            ulong idle = idle2 - idle1;
+            ulong kern = kern2 - kern1;
+            ulong user = user2 - user1;
+
+            ulong total = kern + user;
+            if (total == 0) return 0.0;
+
+            // busy = (kernel + user - idle) / (kernel + user)
+            double busy = Math.Max(0, (double)(total - idle) / total);
+            return Math.Clamp(busy, 0.0, 1.0);
+        }
+
+        // Win32 API: GetSystemTimes
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetSystemTimes(out FILETIME lpIdleTime, out FILETIME lpKernelTime, out FILETIME lpUserTime);
+
+        // FILETIME → 64bit
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FILETIME { public uint dwLowDateTime; public uint dwHighDateTime; }
+
+        private static ulong ToULong(FILETIME ft) => ((ulong)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
     }
+
 }
