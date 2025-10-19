@@ -6,8 +6,8 @@ namespace MessageQueue.Roll;
 
 public sealed class Worker
 {
-    private readonly string _host;
-    private readonly int _port;
+    private readonly string _host; private readonly int _port;
+    private readonly DedupCache _dedup = new(TimeSpan.FromMinutes(10));
 
     public Worker(string host, int port) { _host = host; _port = port; }
 
@@ -19,7 +19,7 @@ public sealed class Worker
 
         await Codec.WriteAsync(ns, new Message { Type = MsgType.HelloWorker }, ct);
 
-        // 最初のクレジット（1）
+        // 最初のクレジット
         await SendCreditAsync(ns, 1, ct);
 
         while (!ct.IsCancellationRequested)
@@ -29,20 +29,31 @@ public sealed class Worker
 
             if (m.Type == MsgType.AssignJob)
             {
-                // ダミー処理（本来は実際のジョブ実行）
+                var jobId = m.MsgId; // = JobId
+                if (_dedup.Contains(jobId))
+                {
+                    // すでに処理済み → 即AckでOK
+                    await Codec.WriteAsync(ns, new Message { Type = MsgType.AckJob, CorrId = jobId }, ct);
+                    continue;
+                }
+
+                // 実処理（ここはアプリ依存）
                 await Task.Delay(500, ct);
-                await Codec.WriteAsync(ns, new Message { Type = MsgType.AckJob }, ct);
+
+                _dedup.TryAdd(jobId);
+                await Codec.WriteAsync(ns, new Message { Type = MsgType.AckJob, CorrId = jobId }, ct);
 
                 // 次のクレジット
                 await SendCreditAsync(ns, 1, ct);
+                _dedup.Sweep();
             }
         }
     }
 
     private static async Task SendCreditAsync(NetworkStream ns, int credit, CancellationToken ct)
     {
-        var buf = new byte[4];
+        Span<byte> buf = stackalloc byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(buf, credit);
-        await Codec.WriteAsync(ns, new Message { Type = MsgType.Credit, Payload = buf.ToArray() }, ct);
+        await Codec.WriteAsync(ns, new Message { Type = MsgType.Credit, MsgId = Guid.NewGuid(), Payload = buf.ToArray() }, ct);
     }
 }

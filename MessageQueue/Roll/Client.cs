@@ -6,9 +6,7 @@ namespace MessageQueue.Roll;
 
 public sealed class Client
 {
-    private readonly string _host;
-    private readonly int _port;
-
+    private readonly string _host; private readonly int _port;
     public Client(string host, int port) { _host = host; _port = port; }
 
     public async Task RunAsync(CancellationToken ct)
@@ -21,9 +19,12 @@ public sealed class Client
 
         for (int i = 0; i < 5; i++)
         {
+            var jobId = Guid.NewGuid(); // Job単位のID
             var payload = Encoding.UTF8.GetBytes($"job-{i}");
-            await Codec.WriteAsync(ns, new Message { Type = MsgType.SubmitJob, Payload = payload }, ct);
-            Console.WriteLine($"Submitted: job-{i}");
+            await Codec.WriteAsync(ns, new Message { Type = MsgType.SubmitJob, MsgId = jobId, Payload = payload }, ct);
+
+            // 仮に同じものをもう一度送っても、Leader 側で重複無視
+            // await Codec.WriteAsync(ns, new Message { Type = MsgType.SubmitJob, MsgId = jobId, Payload = payload }, ct);
         }
     }
 }

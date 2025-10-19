@@ -7,12 +7,14 @@ public static class Codec
 {
     public static async Task WriteAsync(NetworkStream ns, Message m, CancellationToken ct)
     {
-        int bodyLen = 1 + 4 + m.Payload.Length; // type(1) + payloadLen(4) + payload
+        int bodyLen = 1 + 16 + 16 + 4 + m.Payload.Length;
         var len = new byte[4];
-
         BinaryPrimitives.WriteInt32LittleEndian(len, bodyLen);
         await ns.WriteAsync(len, ct);
+
         await ns.WriteAsync(new[] { (byte)m.Type }, ct);
+        await ns.WriteAsync(m.MsgId.ToByteArray(), ct);
+        await ns.WriteAsync(m.CorrId.ToByteArray(), ct);
 
         var pl = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(pl, m.Payload.Length);
@@ -24,21 +26,21 @@ public static class Codec
 
     public static async Task<Message?> ReadAsync(NetworkStream ns, CancellationToken ct)
     {
-        // [length:4]
         var lenBuf = await ReadExactAsync(ns, 4, ct);
-        if (lenBuf is null) return null; // ソケット終了
+        if (lenBuf is null) return null;
         int bodyLen = BinaryPrimitives.ReadInt32LittleEndian(lenBuf);
 
-        // 本文
         var body = await ReadExactAsync(ns, bodyLen, ct);
         if (body is null) return null;
 
         var span = body.AsSpan();
         var type = (MsgType)span[0];
-        int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(1, 4));
-        var payload = payloadLen == 0 ? Array.Empty<byte>() : span.Slice(5, payloadLen).ToArray();
+        var msgId = new Guid(span.Slice(1, 16));
+        var corr = new Guid(span.Slice(17, 16));
+        int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(33, 4));
+        var payload = payloadLen == 0 ? Array.Empty<byte>() : span.Slice(37, payloadLen).ToArray();
 
-        return new Message { Type = type, Payload = payload };
+        return new Message { Type = type, MsgId = msgId, CorrId = corr, Payload = payload };
     }
 
     private static async Task<byte[]?> ReadExactAsync(NetworkStream ns, int n, CancellationToken ct)
@@ -48,10 +50,9 @@ public static class Codec
         while (read < n)
         {
             int r = await ns.ReadAsync(buf.AsMemory(read, n - read), ct);
-            if (r <= 0) return null; // 切断
+            if (r <= 0) return null;
             read += r;
         }
         return buf;
     }
 }
-
