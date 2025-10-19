@@ -2,7 +2,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics.Metrics;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -17,6 +16,10 @@ namespace MessageQueue.Roll;
 public sealed class Leader
 {
     private readonly TcpListener _listener;
+
+    // ==== 永続化 ====
+    private readonly Persistence _store;                 // WAL + Snapshot
+    private DateTime _lastSnapAt = DateTime.UtcNow;      // スナップ最終時刻
 
     // ClientId -> connection
     private readonly ConcurrentDictionary<string, ClientConn> _clients = new();
@@ -56,6 +59,7 @@ public sealed class Leader
     public Leader(int port)
     {
         _listener = new TcpListener(IPAddress.Any, port);
+        _store = new Persistence("state"); // 追加：永続化ストア初期化
 
         // 定期チェック（タイムアウト監視 + スケジューリング）
         _pumpTimer = new System.Timers.Timer(200);
@@ -66,6 +70,14 @@ public sealed class Leader
             {
                 CheckTimeouts();
                 PumpAllExec();
+
+                // 追加：軽量スナップショット（1分ごと）
+                if ((DateTime.UtcNow - _lastSnapAt) > TimeSpan.FromMinutes(1))
+                {
+                    _lastSnapAt = DateTime.UtcNow;
+                    var snap = BuildSnapshot();
+                    _ = _store.SnapshotAsync(snap);
+                }
             }
             catch (Exception ex)
             {
@@ -79,6 +91,9 @@ public sealed class Leader
         _listener.Start();
         _pumpTimer.Start();
         Console.WriteLine("[Leader] listening...");
+
+        // 起動時復旧はバックグラウンドで実行（待たない）
+        _ = Task.Run(() => RecoverAsync(ct), ct);
 
         try
         {
@@ -108,7 +123,7 @@ public sealed class Leader
             // ClientId は Subject に入れて名乗る
             var clientId = string.IsNullOrWhiteSpace(hello.Subject) ? Guid.NewGuid().ToString("N") : hello.Subject;
 
-            // ★ 追加: 希望並列数の取得（payloadがあれば）
+            // ★ 希望並列数の取得（payloadがあれば）
             int cap = 4; // 既定
             try
             {
@@ -168,6 +183,8 @@ public sealed class Leader
                         // ★ Client inflight をデクリメントして再チャレンジできるように
                         _clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
                         Console.WriteLine($"[Leader] Requeued {inf.Job.JobId} (owner down)");
+                        // WAL: worker_down_requeue（ベストエフォート）
+                        _ = _store.AppendAsync(new WalWorkerDownRequeue("worker_down_requeue", DateTime.UtcNow, inf.Job.JobId, wc.WorkerId), durable: false);
                     }
                 }
             }
@@ -198,6 +215,10 @@ public sealed class Leader
                 Enqueue(exec, env);
 
                 Console.WriteLine($"[Leader] Enqueued {req.JobId} exec={exec} from client={req.ClientId}");
+                // WAL: enqueue（重要→durable）
+                await _store.AppendAsync(new WalEnqueue("enqueue", DateTime.UtcNow,
+                    new JobWire(env.JobId, env.ClientId, env.ExecName, env.RawPayload)), durable: true, ct);
+
                 PumpAllExec();
             }
         }
@@ -225,19 +246,7 @@ public sealed class Leader
             {
                 case MsgType.Credit:
                     {
-                        //分散ジョブ実行の制御問題
-                        //Leader はたくさんの Worker にジョブを割り振ります。
-                        //でも、無制限に送ると──
-                        //Worker の CPU がパンクする
-                        //ネットワークが詰まる
-                        //途中で落ちたジョブの再送が難しくなる
-                        //といった問題が起きます。
-                        //💡 そこで導入されているのが「Credit 制御」
-                        //Worker は「いま、あと何件ジョブを受けられるか」を Leader に知らせます。
-                        //この「受け入れ可能件数（スロット）」を Credit（クレジット） と呼びます。
-
                         // --- 強化版 Credit 反映 ---
-                        // 1) payload から int32LE を安全に読取
                         int delta = 1;
                         if (m.Payload is { Length: 4 })
                         {
@@ -245,29 +254,21 @@ public sealed class Leader
                         }
                         else if (m.Payload is { Length: > 0 })
                         {
-                            // 4byte 以外は不正として無視（ログのみ）
                             Console.WriteLine($"[Leader] invalid credit payload len={m.Payload.Length} from {wc.WorkerId}");
                             break;
                         }
 
-                        // 2) 不正/極端な値のガード
-                        //    - 0以下は無視
-                        //    - 上限を設ける（偶発/悪意の過大Credit抑制）
                         const int MaxCreditPerMessage = 10_000;
                         if (delta <= 0) break;
                         if (delta > MaxCreditPerMessage) delta = MaxCreditPerMessage;
 
-                        // 3) 競合に強い加算
                         int after = System.Threading.Interlocked.Add(ref wc.Credit, delta);
-                        // underflow/overflow の保険（理論上 after < 0 にはならないが念のため）
                         if (after < 0)
                         {
-                            // 異常値を検知したら 0 に補正
                             System.Threading.Interlocked.Exchange(ref wc.Credit, 0);
                             Console.WriteLine($"[Leader] credit underflow fixed for {wc.WorkerId}");
                         }
 
-                        // 4) 実際に増えたらスケジューリングを回す
                         PumpAllExec();
                     }
                     break;
@@ -275,7 +276,6 @@ public sealed class Leader
                 case MsgType.AckJob:
                     if (_inflight.TryRemove(m.CorrId, out var inf))
                     {
-                        // ★ Ack時にCredit++していた既存コードを削除（ここでは増やさない）
                         wc.Running--;
 
                         // Client側へ結果中継
@@ -303,6 +303,9 @@ public sealed class Leader
                         _clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
 
                         Console.WriteLine($"[Leader] Ack {m.CorrId} from {wc.WorkerId}");
+                        // WAL: ack（重要→durable）
+                        await _store.AppendAsync(new WalAck("ack", DateTime.UtcNow, inf.Job.JobId, inf.Job.ClientId), durable: true, ct);
+
                         PumpAllExec(); // 次の割り当てを早める
                     }
                     break;
@@ -357,7 +360,6 @@ public sealed class Leader
             {
                 // 上限超過：末尾へ戻す & 他のジョブを当てる
                 queue.Enqueue(job);
-                // 他のexecへ回ってもらう
                 break;
             }
 
@@ -390,6 +392,9 @@ public sealed class Leader
             _inflight[job.JobId] = new Inflight(job, wc, DateTime.UtcNow + timeout, timeout, attempt);
 
             Console.WriteLine($"[Leader] Assigned {job.JobId} -> {wc.WorkerId} exec={job.ExecName} try={attempt}");
+
+            // WAL: assign（観測可能副作用後にFlushでもOK）
+            await _store.AppendAsync(new WalAssign("assign", DateTime.UtcNow, job.JobId, wc.WorkerId, attempt), durable: true);
         }
         catch (Exception ex)
         {
@@ -414,6 +419,8 @@ public sealed class Leader
                 _dlq.Enqueue(inf.Job);
                 // ★ in-flight戻し
                 _clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+                // WAL: dlq（重要→durable）
+                _ = _store.AppendAsync(new WalDlq("dlq", DateTime.UtcNow, inf.Job.JobId), durable: true);
                 continue;
             }
 
@@ -431,6 +438,8 @@ public sealed class Leader
             }
 
             _ = SendAssignAsync(target!, inf.Job, inf.Attempt + 1);
+            // WAL: timeout_requeue（頻発可→非durableでOK）
+            _ = _store.AppendAsync(new WalTimeoutRequeue("timeout_requeue", DateTime.UtcNow, inf.Job.JobId, inf.Attempt), durable: false);
         }
     }
 
@@ -446,6 +455,129 @@ public sealed class Leader
         var t = initial;
         for (int i = 0; i < n; i++) t = NextTimeout(t);
         return t;
+    }
+
+    // ====== Snapshotビルド ======
+    private LeaderStateSnapshot BuildSnapshot()
+    {
+        var snap = new LeaderStateSnapshot();
+
+        foreach (var kv in _execQueues)
+        {
+            var list = new List<JobWire>();
+            foreach (var job in kv.Value.ToArray())
+                list.Add(new JobWire(job.JobId, job.ClientId, job.ExecName, job.RawPayload));
+            snap.Queues[kv.Key] = list;
+        }
+
+        foreach (var kv in _inflight)
+        {
+            var inf = kv.Value;
+            snap.Inflight[kv.Key] = new InflightWire(
+                new JobWire(inf.Job.JobId, inf.Job.ClientId, inf.Job.ExecName, inf.Job.RawPayload),
+                OwnerWorker: inf.Owner?.WorkerId,
+                DueAt: inf.DueAt, Timeout: inf.Timeout, Attempt: inf.Attempt
+            );
+        }
+
+        snap.Dlq.AddRange(_dlq.ToArray().Select(j => new JobWire(j.JobId, j.ClientId, j.ExecName, j.RawPayload)));
+        foreach (var kv in _clientCap) snap.ClientCap[kv.Key] = kv.Value;
+        foreach (var kv in _clientInflight) snap.ClientInflight[kv.Key] = kv.Value;
+        return snap;
+    }
+
+    // ====== 起動時復旧 ======
+    private async Task RecoverAsync(CancellationToken ct)
+    {
+        try
+        {
+            var (snap, lines) = await _store.LoadAsync(ct);
+
+            // 1) スナップショット適用
+            if (snap is not null)
+            {
+                foreach (var kv in snap.Queues)
+                {
+                    var q = _execQueues.GetOrAdd(kv.Key, _ => new ConcurrentQueue<JobEnvelope>());
+                    foreach (var w in kv.Value)
+                        q.Enqueue(new JobEnvelope(w.JobId, w.ClientId, w.ExecName, w.RawPayload));
+                    if (!q.IsEmpty && _execInRound.TryAdd(kv.Key, 1))
+                        _execRound.Enqueue(kv.Key);
+                }
+                foreach (var kv in snap.Inflight)
+                {
+                    var w = kv.Value;
+                    _inflight[kv.Key] = new Inflight(
+                        new JobEnvelope(w.Job.JobId, w.Job.ClientId, w.Job.ExecName, w.Job.RawPayload),
+                        Owner: null, // Workerは再接続まで null 扱い
+                        DueAt: w.DueAt, Timeout: w.Timeout, Attempt: w.Attempt
+                    );
+                }
+                foreach (var w in snap.Dlq)
+                    _dlq.Enqueue(new JobEnvelope(w.JobId, w.ClientId, w.ExecName, w.RawPayload));
+
+                foreach (var kv in snap.ClientCap) _clientCap[kv.Key] = kv.Value;
+                foreach (var kv in snap.ClientInflight) _clientInflight[kv.Key] = kv.Value;
+            }
+
+            // 2) WAL リプレイ（最新スナップ後の差分）
+            foreach (var line in lines)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                using var doc = JsonDocument.Parse(line);
+                if (!doc.RootElement.TryGetProperty("type", out var tProp)) continue;
+                var type = tProp.GetString();
+
+                switch (type)
+                {
+                    case "enqueue":
+                        var enq = JsonSerializer.Deserialize<WalEnqueue>(line)!;
+                        var job = enq.job;
+                        Enqueue(job.ExecName, new JobEnvelope(job.JobId, job.ClientId, job.ExecName, job.RawPayload));
+                        break;
+
+                    case "assign":
+                        // in-flight に反映（ownerは再接続待ち）
+                        var asg = JsonSerializer.Deserialize<WalAssign>(line)!;
+                        if (_inflight.TryGetValue(asg.jobId, out var inf))
+                        {
+                            _inflight[asg.jobId] = inf; // 必要ならAttempt調整
+                        }
+                        break;
+
+                    case "ack":
+                        var ack = JsonSerializer.Deserialize<WalAck>(line)!;
+                        _inflight.TryRemove(ack.jobId, out _);
+                        _clientInflight.AddOrUpdate(ack.clientId, 0, (_, v) => Math.Max(0, v - 1));
+                        break;
+
+                    case "timeout_requeue":
+                    case "worker_down_requeue":
+                        var r = type == "timeout_requeue"
+                            ? JsonSerializer.Deserialize<WalTimeoutRequeue>(line)!.jobId
+                            : JsonSerializer.Deserialize<WalWorkerDownRequeue>(line)!.jobId;
+                        if (_inflight.TryRemove(r, out var inf2))
+                        {
+                            Enqueue(inf2.Job.ExecName, inf2.Job);
+                            _clientInflight.AddOrUpdate(inf2.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+                        }
+                        break;
+
+                    case "dlq":
+                        var d = JsonSerializer.Deserialize<WalDlq>(line)!.jobId;
+                        if (_inflight.TryRemove(d, out var inf3))
+                            _dlq.Enqueue(inf3.Job);
+                        break;
+                }
+            }
+
+            Console.WriteLine("[Leader] recovery completed.");
+            PumpAllExec();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Leader] recovery failed: {ex.Message}");
+        }
     }
 
     // ==== inner types ====

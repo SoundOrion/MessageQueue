@@ -1,0 +1,378 @@
+いいですね。**Leader の状態（キュー／in-flight／DLQ）をディスク永続化**する実装方針と、最小変更で入れられるコード例をまとめます。既存構成はそのまま活かしつつ、**JSON Lines のWAL（追記ログ）＋定期スナップショット**で堅牢にします。
+
+---
+
+# 設計指針（最小実装で堅牢に）
+
+1. **イベントWAL**（`state/events.log`）
+
+* append-only（追記のみの JSONL）
+* 代表イベント:
+
+  * `enqueue`（Submit 受付）
+  * `assign`（Workerに割当／attempt 付き）
+  * `ack`（完了）
+  * `timeout_requeue`（再送トリガ）
+  * `dlq`（試行上限超過でDLQへ）
+  * `worker_down_requeue`（Worker切断で回収）
+* クラッシュ復旧は **ログの順にリプレイ**して実メモリ構造を再構築。
+
+2. **スナップショット**（`state/snapshots/state-YYYYMMDD-HHMMSS.json`）
+
+* 数千～数万イベントで `events.log` が育つため、**N分ごと** or **N件ごと**にメモリ状態を丸ごと保存。
+* 起動時は「最新スナップショット → そこから後続のWAL」を再生して早く復旧。
+
+3. **フラッシュ**
+
+* 重要イベント（`enqueue`, `ack`, `dlq`）直後は **`FileStream.Flush(true)`**（`Flush` + `fsync`）して電源断でも落とさない。
+* `assign` は“観測可能副作用”（送信）前に記録（書いてから送る or 送信成功後すぐFlush）。最小実装では送信直後FlushでOK。
+
+4. **互換性**
+
+* 既存 API/プロトコルは無変更（`Leader` 内部だけ拡張）。`Program.cs`・`Client`・`Worker` はそのまま。
+
+---
+
+# 追加ファイル：`Persistence.cs`
+
+```csharp
+// /Persistence.cs
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace MessageQueue.Roll;
+
+public sealed class Persistence : IAsyncDisposable
+{
+    readonly string _root;
+    readonly string _walPath;
+    FileStream _wal;
+    readonly JsonSerializerOptions _jso = new(JsonSerializerDefaults.Web);
+
+    public Persistence(string rootDir = "state")
+    {
+        _root = rootDir;
+        Directory.CreateDirectory(_root);
+        _walPath = Path.Combine(_root, "events.log");
+        _wal = new FileStream(_walPath, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, FileOptions.Asynchronous);
+    }
+
+    public async Task AppendAsync(object record, bool durable = true, CancellationToken ct = default)
+    {
+        var json = JsonSerializer.Serialize(record, _jso);
+        var bytes = Encoding.UTF8.GetBytes(json + "\n");
+        await _wal.WriteAsync(bytes, 0, bytes.Length, ct);
+        if (durable) await _wal.FlushAsync(ct); // Flush(true) 相当は .NET で OS に依存。十分堅牢でなければ P/Invoke で fsync も可。
+    }
+
+    public async Task SnapshotAsync(LeaderStateSnapshot snap, CancellationToken ct = default)
+    {
+        var dir = Path.Combine(_root, "snapshots");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, $"state-{DateTime.UtcNow:yyyyMMdd-HHmmss}.json");
+        await File.WriteAllTextAsync(path, JsonSerializer.Serialize(snap, _jso), ct);
+    }
+
+    public async Task<(LeaderStateSnapshot? snapshot, IEnumerable<string> walLines)> LoadAsync(CancellationToken ct = default)
+    {
+        LeaderStateSnapshot? snap = null;
+
+        var dir = Path.Combine(_root, "snapshots");
+        if (Directory.Exists(dir))
+        {
+            string? last = null;
+            foreach (var f in Directory.GetFiles(dir, "state-*.json"))
+                if (last is null || string.Compare(f, last, StringComparison.Ordinal) > 0) last = f;
+            if (last != null)
+            {
+                var json = await File.ReadAllTextAsync(last, ct);
+                snap = JsonSerializer.Deserialize<LeaderStateSnapshot>(json, _jso);
+            }
+        }
+
+        var lines = File.Exists(_walPath) ? File.ReadLines(_walPath) : Array.Empty<string>();
+        return (snap, lines);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try { await _wal.FlushAsync(); } catch {}
+        _wal.Dispose();
+    }
+}
+
+// ---- スナップショット用DTO ----
+public sealed class LeaderStateSnapshot
+{
+    public Dictionary<string, List<JobWire>> Queues { get; init; } = new(); // exec -> jobs
+    public Dictionary<Guid, InflightWire> Inflight { get; init; } = new();  // jobId -> inflight
+    public List<JobWire> Dlq { get; init; } = new();
+    public Dictionary<string,int> ClientCap { get; init; } = new();
+    public Dictionary<string,int> ClientInflight { get; init; } = new();
+}
+
+public sealed record JobWire(Guid JobId, string ClientId, string ExecName, byte[] RawPayload);
+public sealed record InflightWire(JobWire Job, Guid? OwnerWorker, DateTime DueAt, TimeSpan Timeout, int Attempt);
+
+// ---- WALレコード ----
+public sealed record WalEnqueue(string type, DateTime at, JobWire job);
+public sealed record WalAssign(string type, DateTime at, Guid jobId, Guid? workerId, int attempt);
+public sealed record WalAck(string type, DateTime at, Guid jobId, string clientId);
+public sealed record WalTimeoutRequeue(string type, DateTime at, Guid jobId, int attempt);
+public sealed record WalDlq(string type, DateTime at, Guid jobId);
+public sealed record WalWorkerDownRequeue(string type, DateTime at, Guid jobId, Guid workerId);
+```
+
+---
+
+# Leader への組み込みポイント
+
+`Leader.cs` に **`Persistence` をフィールド追加**し、イベントで `AppendAsync` を呼びます。該当箇所だけ抜粋（★印）で示します。
+
+### 1) フィールド／初期化
+
+```csharp
+// Leader フィールドに追加
+private readonly Persistence _store;
+private DateTime _lastSnapAt = DateTime.UtcNow;
+
+// コンストラクタ
+public Leader(int port)
+{
+    _listener = new TcpListener(IPAddress.Any, port);
+    _store = new Persistence("state"); // ★ 追加
+
+    // 起動時に復旧
+    _ = Task.Run(() => RecoverAsync(CancellationToken.None));
+
+    // 既存の _pumpTimer 初期化はそのまま
+}
+```
+
+### 2) Submit 受付 → enqueue 記録
+
+`HandleClientAsync` の `SubmitJob` 受信直後に追加：
+
+```csharp
+// 既存:
+var env = new JobEnvelope(req.JobId, req.ClientId, exec, m.Payload);
+Enqueue(exec, env);
+Console.WriteLine($"[Leader] Enqueued {req.JobId} exec={exec} from client={req.ClientId}");
+
+// ★ 追加：WAL
+await _store.AppendAsync(new WalEnqueue("enqueue", DateTime.UtcNow,
+    new JobWire(env.JobId, env.ClientId, env.ExecName, env.RawPayload)), durable:true);
+```
+
+### 3) Assign 成功時に記録
+
+`SendAssignAsync` で送信成功後：
+
+```csharp
+// 既存の _inflight[...] = new Inflight(...); の直後に
+await _store.AppendAsync(new WalAssign("assign", DateTime.UtcNow, job.JobId, wc.WorkerId, attempt), durable:true);
+```
+
+> 注: 「送信→記録」順にしています。厳密な once 保障が要る場合は “記録→送信” にして、送信失敗時に `assign_failed` をWALへ書いて補正します。最小構成では上記で十分です。
+
+### 4) Ack 受信時
+
+`case MsgType.AckJob:` の最後に：
+
+```csharp
+await _store.AppendAsync(new WalAck("ack", DateTime.UtcNow, inf.Job.JobId, inf.Job.ClientId), durable:true);
+```
+
+### 5) Timeout で再送／DLQ
+
+`CheckTimeouts()` の `MaxAttempts` 超過時:
+
+```csharp
+_dlq.Enqueue(inf.Job);
+_clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+await _store.AppendAsync(new WalDlq("dlq", DateTime.UtcNow, inf.Job.JobId), durable:true);
+```
+
+再送をセットしたとき:
+
+```csharp
+await _store.AppendAsync(new WalTimeoutRequeue("timeout_requeue", DateTime.UtcNow, inf.Job.JobId, inf.Attempt), durable:false);
+```
+
+### 6) Worker 切断で回収
+
+`HandleConnAsync` 末尾の Worker 切断ハンドリングで、回収時：
+
+```csharp
+await _store.AppendAsync(new WalWorkerDownRequeue("worker_down_requeue", DateTime.UtcNow, inf.Job.JobId, wc.WorkerId), durable:false);
+```
+
+### 7) 定期スナップショット（省メモリ・高速復旧）
+
+`_pumpTimer.Elapsed` のたび（または N 秒おき）に軽量チェック：
+
+```csharp
+if ((DateTime.UtcNow - _lastSnapAt) > TimeSpan.FromMinutes(1))
+{
+    _lastSnapAt = DateTime.UtcNow;
+    var snap = BuildSnapshot();
+    _ = _store.SnapshotAsync(snap); // await しない（best-effort）
+}
+```
+
+`BuildSnapshot()` は現在のメモリ状態を `LeaderStateSnapshot` に詰めます：
+
+```csharp
+private LeaderStateSnapshot BuildSnapshot()
+{
+    var snap = new LeaderStateSnapshot();
+
+    foreach (var kv in _execQueues)
+    {
+        var list = new List<JobWire>();
+        foreach (var job in kv.Value.ToArray())
+            list.Add(new JobWire(job.JobId, job.ClientId, job.ExecName, job.RawPayload));
+        snap.Queues[kv.Key] = list;
+    }
+
+    foreach (var kv in _inflight)
+    {
+        var inf = kv.Value;
+        snap.Inflight[kv.Key] = new InflightWire(
+            new JobWire(inf.Job.JobId, inf.Job.ClientId, inf.Job.ExecName, inf.Job.RawPayload),
+            ownerWorker: inf.Owner?.WorkerId,
+            DueAt: inf.DueAt, Timeout: inf.Timeout, Attempt: inf.Attempt
+        );
+    }
+
+    snap.Dlq.AddRange(_dlq.ToArray().Select(j => new JobWire(j.JobId, j.ClientId, j.ExecName, j.RawPayload)));
+    foreach (var kv in _clientCap) snap.ClientCap[kv.Key] = kv.Value;
+    foreach (var kv in _clientInflight) snap.ClientInflight[kv.Key] = kv.Value;
+    return snap;
+}
+```
+
+### 8) 起動時の復旧処理
+
+`RecoverAsync` を `Leader` に追加し、コンストラクタで起動済み（上記1）：
+
+```csharp
+private async Task RecoverAsync(CancellationToken ct)
+{
+    try
+    {
+        var (snap, lines) = await _store.LoadAsync(ct);
+
+        // 1) スナップショット適用
+        if (snap is not null)
+        {
+            foreach (var kv in snap.Queues)
+            {
+                var q = _execQueues.GetOrAdd(kv.Key, _ => new System.Collections.Concurrent.ConcurrentQueue<JobEnvelope>());
+                foreach (var w in kv.Value)
+                    q.Enqueue(new JobEnvelope(w.JobId, w.ClientId, w.ExecName, w.RawPayload));
+                if (!q.IsEmpty && _execInRound.TryAdd(kv.Key, 1))
+                    _execRound.Enqueue(kv.Key);
+            }
+            foreach (var kv in snap.Inflight)
+            {
+                var w = kv.Value;
+                _inflight[kv.Key] = new Inflight(
+                    new JobEnvelope(w.Job.JobId, w.Job.ClientId, w.Job.ExecName, w.Job.RawPayload),
+                    owner: null /* Workerは再接続までnull扱い */,
+                    DueAt: w.DueAt, Timeout: w.Timeout, Attempt: w.Attempt
+                );
+            }
+            foreach (var w in snap.Dlq)
+                _dlq.Enqueue(new JobEnvelope(w.JobId, w.ClientId, w.ExecName, w.RawPayload));
+
+            foreach (var kv in snap.ClientCap) _clientCap[kv.Key] = kv.Value;
+            foreach (var kv in snap.ClientInflight) _clientInflight[kv.Key] = kv.Value;
+        }
+
+        // 2) WAL リプレイ
+        foreach (var line in lines)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            using var doc = JsonDocument.Parse(line);
+            if (!doc.RootElement.TryGetProperty("type", out var tProp)) continue;
+            var type = tProp.GetString();
+
+            switch (type)
+            {
+                case "enqueue":
+                    var enq = JsonSerializer.Deserialize<WalEnqueue>(line);
+                    var job = enq!.job;
+                    Enqueue(job.ExecName, new JobEnvelope(job.JobId, job.ClientId, job.ExecName, job.RawPayload));
+                    break;
+
+                case "assign":
+                    // in-flight へ反映（owner は起動直後は null。実Worker接続後に上書き）
+                    var asg = JsonSerializer.Deserialize<WalAssign>(line)!;
+                    if (_inflight.TryGetValue(asg.jobId, out var inf))
+                    {
+                        // 既にあれば attempt だけ最大へ
+                        _inflight[asg.jobId] = inf with { /* Attempt = Math.Max(inf.Attempt, asg.attempt) */ };
+                    }
+                    break;
+
+                case "ack":
+                    var ack = JsonSerializer.Deserialize<WalAck>(line)!;
+                    _inflight.TryRemove(ack.jobId, out _);
+                    _clientInflight.AddOrUpdate(ack.clientId, 0, (_, v) => Math.Max(0, v - 1));
+                    break;
+
+                case "timeout_requeue":
+                case "worker_down_requeue":
+                    var r = type == "timeout_requeue"
+                        ? JsonSerializer.Deserialize<WalTimeoutRequeue>(line)!.jobId
+                        : JsonSerializer.Deserialize<WalWorkerDownRequeue>(line)!.jobId;
+                    if (_inflight.TryRemove(r, out var inf2))
+                    {
+                        Enqueue(inf2.Job.ExecName, inf2.Job);
+                        _clientInflight.AddOrUpdate(inf2.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+                    }
+                    break;
+
+                case "dlq":
+                    var d = JsonSerializer.Deserialize<WalDlq>(line)!.jobId;
+                    if (_inflight.TryRemove(d, out var inf3))
+                        _dlq.Enqueue(inf3.Job);
+                    break;
+            }
+        }
+
+        Console.WriteLine("[Leader] recovery completed.");
+        PumpAllExec();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Leader] recovery failed: {ex.Message}");
+    }
+}
+```
+
+---
+
+# 運用ヒント
+
+* **保存先**は `./state/`（アプリ相対）。コンテナなら永続ボリュームをマウント。
+* **WALローテーション**：`events.log` が大きくなったら最新スナップショット作成後に `events.log` を切替。
+* **監視**：`snapshots` 作成の失敗・WAL書込み失敗をエラーカウンタで監視。
+* **整合性**：スナップショット中も実行は続くため、WALに **`snapshot_marker`** を挿入すれば、一貫性復旧がさらにシンプルになります（必須ではない）。
+
+---
+
+# 既存コードとの関係（参照）
+
+* Leader のイベント発生箇所はすべて既存にあり、そこへ数行追加するだけでOK。
+* 他コンポーネント（Client／Worker／Protocol／Codec）はそのまま。
+
+---
+
+必要なら、このパッチを丸ごと適用したブランチ用に**差分（git patch）**形式で出します。まずはこの設計でいきましょう。どの粒度（Flush戦略・スナップ周期・ログ回転）にしますか？

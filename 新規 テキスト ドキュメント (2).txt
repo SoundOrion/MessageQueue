@@ -1,0 +1,177 @@
+いいリクエストです。**「同一グループ内で Leader が落ちたら、別サーバーが自動で新 Leader になり、直ちにキュー／in-flight／DLQを復元して処理再開」**を実現する設計と、最小差分で入れられる実装案を出します。
+（既存の TCP フレーミング・イベントWAL設計をそのまま活かします）
+
+---
+
+# 目標像（要点）
+
+* **単一リーダーモデル（Active–Passive）**：クラスタ内に常に Leader は1台。
+* **合意付きのログ複製**：イベントWAL（enqueue/assign/ack/…）を **Leader→Follower へ同期**。Follower は **コミット済み**のみ適用。
+* **フェイルオーバ**：Leader が見えなくなったら Follower がランダムタイムアウトで **選挙** → 過半数の投票を得たノードが新 Leader に。
+* **クライアント/ワーカー透過**：Follower に繋いだ場合は **`NotLeader` でリダイレクト**（現Leaderの`host:port`を通知）。Client/Worker はそれを受けて自動再接続する（既存の接続確立コードに数行追加でOK）。
+
+> フルRaft実装は重いので、ここでは **Raftライト**（任期/投票/AppendEntries/ハートビート）だけを作り、**ログの内容は既存WALイベント**をそのまま使う方針です。
+> 既存の「状態復元（WAL+スナップショット）」は各ノードが保持します（Leader 交代直後も即復元可能）。
+
+---
+
+# 新規プロトコル（メッセージ）
+
+`Message.cs` の `MsgType` に以下を追加（後方互換を崩さず拡張）：
+
+* `NotLeader`（Follower→Client/Worker へのリダイレクト）
+* `LeaderHello`（クラスタ隣接ノード間の握手）
+* `AppendEntries`（Leader→Follower：イベントWALの項目、ハートビート時は空）
+* `AppendResp`（Follower→Leader：ACK/不一致）
+* `RequestVote` / `VoteResp`（選挙）
+* `InstallSnapshot` / `InstallSnapResp`（スナップショット転送：大きくなった時用）
+
+Subject は `"cluster.<groupId>.*"` の形に。Payload は JSON（`term`, `leaderId`, `prevLogIndex`, `prevLogTerm`, `entries[]`, `leaderCommit` 等）。
+
+---
+
+# 新規クラス：`ClusterNode`（Raftライト）
+
+最小責務：
+
+* ノードロール：`Follower|Candidate|Leader`
+* 任期 `currentTerm` / 投票先 `votedFor`
+* ログ：**WALエントリ**列（既存 `WalEnqueue` 等を同梱）
+  → **コミット**された index までを `Leader` 本体へ通知して適用（＝既存のメモリ状態に反映）。
+* ネットワーク：同じ TCP/Codec で peer と相互接続（既存の `Codec` をそのまま使う）。
+
+## 反映ポイント
+
+* **Leader の「状態変更イベント発生箇所」**（enqueue / assign / ack / timeout / dlq / worker_down_requeue）で、
+  これまで「WAL に append」していたところを **`ClusterNode.AppendAndReplicate(entries)` に一本化**。
+  `ClusterNode` は **過半数 ACK で commit** → `OnCommit(entries)` コールバックで **既存の `Leader` 内処理**（`Enqueue`/`_inflight`更新/`_clientInflight`増減…）を呼ぶ設計にします。
+
+* 既存の「タイムアウト・再送・DLQ」は **Commit 後にだけ**発火（Follower は発火しない）。
+  つまり **唯一のライター**は Leader（Raftの特性）。
+
+---
+
+# Client / Worker のリダイレクト対応
+
+Follower に接続→`HelloClient`/`HelloWorker` を受けたら、Follower は **`NotLeader` を即返答**（`payload: {"leader":"host:port"}`）し、ソケットを閉じます。
+`Client` / `Worker` 側は、受信ループ冒頭で `NotLeader` を見たら指定先に再接続（既存の接続処理に数行を追加）。
+
+---
+
+# 実装ステップ（差分方針）
+
+### 1) `MsgType` 拡張（簡易）
+
+```csharp
+// Message.cs
+public enum MsgType : byte
+{
+    // 既存…
+    NotLeader = 20,
+    LeaderHello = 21,
+    AppendEntries = 22,
+    AppendResp = 23,
+    RequestVote = 24,
+    VoteResp = 25,
+    InstallSnapshot = 26,
+    InstallSnapResp = 27
+}
+```
+
+
+
+### 2) `Program.cs` にクラスタ引数
+
+```
+leader <port> [--peers host1:port1,host2:port2 --group <groupId>]
+```
+
+受け取った peers / group を `Leader` に渡す（新しいコンストラクタ引数）。既存分岐はそのまま。
+
+### 3) `Leader` を二層化
+
+* `Leader`：**スケジューラ／キュー管理**の既存責務のみを維持。
+* `ClusterNode`：**合意・複製・選挙**を担当（新規ファイル）。
+  `Leader` は「イベントを作る」→ `ClusterNode.AppendAndReplicate` へ投げる。
+  Commit 通知で `Leader.OnCommitted(entries)` を呼び、**既存の `Enqueue` や `_inflight` 操作**を実行。
+
+> こうすることで、既存のロジック（Credit制御・cap制御・再送/DLQ）をほぼ変更せず、**「誰が適用するのか」を合意で一本化**できます。
+
+### 4) 最小の Raft ライフサイクル
+
+* Follower は **`AppendEntries` を一定間隔で受けている間**は、選挙タイマをリセットして待機。
+* 止まったら `electionTimeout = 250–500ms（ランダム）` で **Candidate 化**→`RequestVote` を peers に送信。
+* 過半数の `VoteResp(granted=true)` を得たら **Leader 昇格**→以後 `AppendEntries`（ハートビートは空エントリ）を 100–200ms で送出。
+* Follower 側は `prevLogIndex/prevLogTerm` が合わなければ **不一致**を返し、Leader は index を巻き戻して差し替え（簡易実装は「1つ戻す」だけでもまず動く）。
+
+### 5) スナップショット転送（InstallSnapshot）
+
+WAL が大きくなったら、Leader は **最新スナップショット**（前提として既に実装済の `BuildSnapshot`）を `InstallSnapshot` で follower に送る。
+Follower はカットオーバして **既存復元ロジック**で再構築。
+
+---
+
+# 既存コードへの具体的組み込み点
+
+**イベント発生箇所＝WAL書き込み箇所**を `ClusterNode.AppendAndReplicate()` に差し替え：
+
+* Submit（`HandleClientAsync`）→ `enqueue`（ジョブ封入）
+* Assign（`SendAssignAsync` 送信成功直後）→ `assign`
+* Ack（`case MsgType.AckJob`）→ `ack`
+* 再送トリガ（`CheckTimeouts`）→ `timeout_requeue` / `dlq`
+* Worker Down 回収（`HandleConnAsync` Worker finally）→ `worker_down_requeue`
+
+`AppendAndReplicate(entries)` は **過半数ACKで commit**→ `Leader.OnCommitted(entries)` を呼ぶ。
+`OnCommitted` 内で **今までやっていた実処理**（`Enqueue`、`_inflight` 登録/削除、`_clientInflight` 増減、DLQ投入、`PumpAllExec()` のキック等）を呼び出し。
+これにより、Follower では commit 前に絶対に副作用を起こさない＝**整合性**が保たれます。
+
+---
+
+# クライアント／ワーカーの変更（数行だけ）
+
+* **受信ループの先頭**で `MsgType.NotLeader` を見たら `payload.leader` へ **即再接続**。
+  既存の接続/再接続コードはあるので（`ClientMulti` の実装が参考）、**単一接続の `Client`/`Worker` にも簡易的に流用**できます。
+
+---
+
+# 障害と復旧の流れ
+
+1. 旧Leaderが停止
+2. Follower が選挙タイムアウト → Candidate → 過半数を得て新Leaderに
+3. 新Leaderは最後にコミットされた index から稼働。未コミットは破棄or再確認。
+4. `InstallSnapshot`（必要に応じ）で遅れた follower を引き上げ
+5. Client/Worker は誤って follower に繋いでも `NotLeader` でリダイレクトされるので自然復旧
+
+---
+
+# まずは段階導入（2フェーズ）
+
+* **Phase 1（最小導入）**
+
+  * `NotLeader` リダイレクト ＋ **静的リーダー**（手動切替）
+  * 既存WAL/スナップショットで**即復元**できることを確認
+* **Phase 2（自動選挙）**
+
+  * `ClusterNode`（RequestVote/AppendEntries）を有効化
+  * ハートビート/選挙タイマをパラメタ化、ログ不一致の巻戻しを実装
+
+---
+
+# なぜこの形が良いか
+
+* 既存の **イベントWAL** と **状態復元**を完全再利用できる
+* スケジューリングや Credit/cap/再送ロジックは **既存の Leader コード**のまま（コミット時だけ呼ぶ）
+* Client/Worker 変更が **最小（NotLeader対応のみ）**
+
+---
+
+# 次アクション（私が出せる差分）
+
+* `ClusterNode.cs`（~300–500行）雛形
+* `Message.cs` 追加 enum
+* `Leader` への **`OnCommitted()` フック**とイベント送出の置き換えパッチ
+* `Client/Worker` の `NotLeader` 再接続数行
+* `Program.cs` の `--peers`/`--group` 受け取り
+
+この方向でよければ、**差分パッチ**をそのまま貼れる形で用意します。
+フェーズ1/2のどちらから入れますか？（フェーズ1なら即日適用可能、フェーズ2は選挙まわりを入れます）
