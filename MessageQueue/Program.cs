@@ -1,55 +1,57 @@
 ﻿using MessageQueue.Roll;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace MessageQueue;
 
-//使い方メモ
-//起動すると Leader(5000) → Worker(A×2, B×1) → Client が A/B にそれぞれ 8 件ずつ投入します。
-//Leader は Subject=グループ でキューを分け、同じグループに属するワーカーへだけ割り当てます。
-//ACK が来ないと 指数バックオフで再送、上限で DLQ に隔離。
-//Program のコンソールで D（DLQ一覧）、R（DLQ再投入） が使えます。
-
-//機能は以下を含みます：
-//Subject 付きメッセージ（Subject 文字列）
-//グループ別キュー（_queues["group"]）
-//複数ワーカー（各ワーカーは所属グループを名乗る）
-//クレジット制
-//再送（指数バックオフ＋最大試行回数）
-//再送上限で DLQ（メモリ） に隔離（必要なら後で永続化へ拡張可能）
-//重複排除（Submit重複／Assign重複）
-
 public static class Program
 {
-    public static async Task Main()
+    public static async Task Main(string[] args)
     {
+        // 使い方:
+        // dotnet run -- leader 5000
+        // dotnet run -- worker 127.0.0.1 5000 job.assign.*
+        // dotnet run -- client 127.0.0.1 5000 clientA
+
+        if (args.Length == 0)
+        {
+            Console.WriteLine("Usage:");
+            Console.WriteLine("  leader <port>");
+            Console.WriteLine("  worker <host> <port> [pattern]");
+            Console.WriteLine("  client <host> <port> <clientId>");
+            return;
+        }
+
         var cts = new CancellationTokenSource();
 
-        var leader = new Leader(port: 5000);
-        _ = Task.Run(() => leader.RunAsync(cts.Token));
-
-        await Task.Delay(200);
-
-        // グループAにワーカー2台、グループBに1台
-        _ = Task.Run(async () => { var w = new Worker("127.0.0.1", 5000, "A"); await w.RunAsync(cts.Token); });
-        _ = Task.Run(async () => { var w = new Worker("127.0.0.1", 5000, "A"); await w.RunAsync(cts.Token); });
-        _ = Task.Run(async () => { var w = new Worker("127.0.0.1", 5000, "B"); await w.RunAsync(cts.Token); });
-
-        await Task.Delay(400);
-
-        // クライアントは A / B それぞれにジョブ投入
-        var clientA = new Client("127.0.0.1", 5000, "A");
-        var clientB = new Client("127.0.0.1", 5000, "B");
-        await clientA.RunAsync(cts.Token);
-        await clientB.RunAsync(cts.Token);
-
-        Console.WriteLine("Press D=Dump DLQ, R=Requeue DLQ, ENTER=stop");
-        while (true)
+        switch (args[0].ToLowerInvariant())
         {
-            var key = Console.ReadKey(true).Key;
-            if (key == ConsoleKey.Enter) break;
-            if (key == ConsoleKey.D) leader.DumpDlq();
-            if (key == ConsoleKey.R) leader.RequeueDlq();
+            case "leader":
+                {
+                    int port = int.Parse(args[1]);
+                    var leader = new Leader(port);
+                    await leader.RunAsync(cts.Token);
+                    break;
+                }
+            case "worker":
+                {
+                    var host = args[1];
+                    int port = int.Parse(args[2]);
+                    var pattern = args.Length > 3 ? args[3] : "job.assign.*";
+                    var w = new Worker(host, port, pattern);
+                    await w.RunAsync(cts.Token);
+                    break;
+                }
+            case "client":
+                {
+                    var host = args[1];
+                    int port = int.Parse(args[2]);
+                    var clientId = args[3];
+                    var cli = new Client(host, port, clientId);
+                    await cli.RunAsync(cts.Token);
+                    break;
+                }
         }
-        cts.Cancel();
     }
 }
-

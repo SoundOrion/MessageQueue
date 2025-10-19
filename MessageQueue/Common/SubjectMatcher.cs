@@ -1,8 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace MessageQueue.Common;
 
@@ -12,24 +8,16 @@ public static class SubjectMatcher
     {
         if (pattern == ">") return true;
 
-        var pSegs = pattern.Split('.', StringSplitOptions.RemoveEmptyEntries);
-        var sSegs = subject.Split('.', StringSplitOptions.RemoveEmptyEntries);
+        var p = pattern.Split('.', StringSplitOptions.RemoveEmptyEntries);
+        var s = subject.Split('.', StringSplitOptions.RemoveEmptyEntries);
 
-        for (int i = 0; i < pSegs.Length; i++)
+        for (int i = 0; i < p.Length; i++)
         {
-            if (pSegs[i] == ">")
-                return true; // 以降すべてOK
-
-            if (i >= sSegs.Length)
-                return false; // subjectが短すぎる
-
-            if (pSegs[i] == "*")
-                continue; // 任意セグメントOK
-
-            if (!pSegs[i].Equals(sSegs[i], StringComparison.OrdinalIgnoreCase))
-                return false;
+            if (p[i] == ">") return true;
+            if (i >= s.Length) return false;
+            if (p[i] == "*") continue;
+            if (!p[i].Equals(s[i], StringComparison.OrdinalIgnoreCase)) return false;
         }
-
-        return sSegs.Length == pSegs.Length;
+        return s.Length == p.Length;
     }
 }

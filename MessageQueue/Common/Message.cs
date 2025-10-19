@@ -5,12 +5,13 @@
 
 public enum MsgType : byte
 {
-    SubmitJob = 1,   // Client -> Leader
-    AssignJob = 2,   // Leader -> Worker
-    AckJob = 3,   // Worker -> Leader
-    Credit = 4,   // Worker -> Leader (受け入れ枠増)
-    HelloClient = 9,   // Client -> Leader (役割宣言)
-    HelloWorker = 10,  // Worker -> Leader (役割宣言: MsgId=workerId, Subject=group)
+    SubmitJob = 1, // Client -> Leader
+    AssignJob = 2, // Leader -> Worker
+    AckJob = 3, // Worker -> Leader (完了通知/ACK)
+    Credit = 4, // Worker -> Leader (受け入れ枠増)
+    Result = 5, // Leader -> Client（Workerから受け取った結果を中継）
+    HelloClient = 9, // Client -> Leader（ClientId を名乗る）
+    HelloWorker = 10 // Worker -> Leader（購読パターンを名乗る）
 }
 
 public sealed class Message
