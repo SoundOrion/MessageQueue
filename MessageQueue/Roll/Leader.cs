@@ -225,6 +225,17 @@ public sealed class Leader
             {
                 case MsgType.Credit:
                     {
+                        //分散ジョブ実行の制御問題
+                        //Leader はたくさんの Worker にジョブを割り振ります。
+                        //でも、無制限に送ると──
+                        //Worker の CPU がパンクする
+                        //ネットワークが詰まる
+                        //途中で落ちたジョブの再送が難しくなる
+                        //といった問題が起きます。
+                        //💡 そこで導入されているのが「Credit 制御」
+                        //Worker は「いま、あと何件ジョブを受けられるか」を Leader に知らせます。
+                        //この「受け入れ可能件数（スロット）」を Credit（クレジット） と呼びます。
+
                         // --- 強化版 Credit 反映 ---
                         // 1) payload から int32LE を安全に読取
                         int delta = 1;
