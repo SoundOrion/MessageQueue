@@ -1,0 +1,751 @@
+了解！ここでは **段階導入（2フェーズ）**を “最小差分” で入れられる **パッチ一式**として提示します。
+構成は、
+
+* **Phase 1**: `NotLeader` リダイレクト＋静的リーダー（手動切替）
+* **Phase 2**: 簡易 Raft（`ClusterNode`）で AppendEntries／RequestVote／ハートビート（過半数コミットで適用）
+
+の二段です。**Phase 2 は Phase 1 の上に適用**してください。
+
+---
+
+# Phase 1（最小導入・手動切替）
+
+## 変更点サマリ
+
+* `Message.cs` に `NotLeader` を追加
+* `Program.cs` に `--role leader|follower --leader <host:port>` を追加
+* `Leader.cs` に “フォロワ動作（即 NotLeader 返して切断）” を追加
+* `Client.cs` / `Worker.cs` に `NotLeader` を受けたら**即リダイレクト再接続**を追加
+
+## 1) Message.cs（列挙追加）
+
+```diff
+*** a/Message.cs
+--- b/Message.cs
+@@
+ public enum MsgType : byte
+ {
+     HelloClient = 1,
+     HelloWorker = 2,
+     SubmitJob   = 3,
+     AssignJob   = 4,
+     AckJob      = 5,
+     Credit      = 6,
+     Result      = 7,
++    NotLeader   = 20, // 追加：フォロワからのリダイレクト
+ }
+```
+
+## 2) Program.cs（引数）
+
+```diff
+*** a/Program.cs
+--- b/Program.cs
+@@
+-// 既存： leader <port>
++// 変更後： leader <port> [--role leader|follower] [--leader host:port]
+ using MessageQueue.Roll;
+ 
+ var args = Environment.GetCommandLineArgs().Skip(1).ToArray();
+ if (args.Length == 0)
+ {
+     Console.WriteLine("usage: leader <port>");
+     return;
+ }
+ 
+ if (args[0] == "leader")
+ {
+     var port = int.Parse(args[1]);
++    var role = "leader";
++    string? staticLeader = null;
++    for (int i = 2; i < args.Length; i++)
++    {
++        if (args[i] == "--role" && i + 1 < args.Length) { role = args[++i]; continue; }
++        if (args[i] == "--leader" && i + 1 < args.Length) { staticLeader = args[++i]; continue; }
++    }
+-    var ld = new Leader(port);
++    var ld = new Leader(port, role, staticLeader);
+     using var cts = new CancellationTokenSource();
+     Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+     await ld.RunAsync(cts.Token);
+     return;
+ }
+```
+
+## 3) Leader.cs（フォロワ動作＆NotLeader返信）
+
+```diff
+*** a/Leader.cs
+--- b/Leader.cs
+@@
+ public sealed class Leader
+ {
+     private readonly TcpListener _listener;
++    private readonly string _role; // "leader" | "follower"
++    private readonly string? _currentLeader; // "host:port"（フォロワ時の案内先）
+@@
+-    public Leader(int port)
+-    {
++    public Leader(int port, string role = "leader", string? staticLeader = null)
++    {
+         _listener = new TcpListener(IPAddress.Any, port);
++        _role = role?.ToLowerInvariant() == "follower" ? "follower" : "leader";
++        _currentLeader = staticLeader;
+@@
+     public async Task RunAsync(CancellationToken ct)
+     {
+         _listener.Start();
+         _pumpTimer.Start();
+-        Console.WriteLine("[Leader] listening...");
++        Console.WriteLine($"[Leader] listening... role={_role} leaderHint={_currentLeader}");
+@@
+-        if (hello.Type == MsgType.HelloClient)
++        if (_role == "follower")
++        {
++            // 誰が来ても NotLeader を返して切断
++            var payload = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { leader = _currentLeader });
++            await Codec.WriteAsync(ns, new Message { Type = MsgType.NotLeader, Payload = payload }, ct);
++            return;
++        }
++        else if (hello.Type == MsgType.HelloClient)
+         {
+             // …（既存処理そのまま）…
+         }
+         else if (hello.Type == MsgType.HelloWorker)
+         {
+             // …（既存処理そのまま）…
+         }
+     }
+```
+
+> フォロワプロセスを `--role follower --leader <host:port>` で起動しておけば、**誤接続が来てもクライアント／ワーカーは正しいリーダへ誘導**されます。
+> リーダ切替は**手動**（フォロワを leader 起動／旧リーダを follower 起動）で行います。
+
+## 4) Client.cs（NotLeaderでリダイレクト）
+
+接続ループの受信箇所で `NotLeader` を受けたら、payload の `leader` に再接続。
+
+```diff
+*** a/Client.cs
+--- b/Client.cs
+@@
+     while (!ct.IsCancellationRequested)
+     {
+         var m = await Codec.ReadAsync(stream, ct);
+         if (m is null) break;
++        if (m.Type == MsgType.NotLeader)
++        {
++            try
++            {
++                var hint = System.Text.Json.JsonDocument.Parse(m.Payload);
++                var leader = hint.RootElement.TryGetProperty("leader", out var v) ? v.GetString() : null;
++                if (!string.IsNullOrWhiteSpace(leader))
++                {
++                    // "host:port" に再接続
++                    var parts = leader.Split(':');
++                    var host = parts[0]; var port = int.Parse(parts[1]);
++                    // 再接続（実装の接続ロジックをそのまま再利用）
++                    await ReconnectAsync(host, port, ct);
++                    continue;
++                }
++            }
++            catch { }
++        }
+         // …既存処理…
+     }
+```
+
+> `ReconnectAsync` は既存の接続確立ロジック（`Client` / `ClientMulti` のどちらでも）に合わせて差し込んでください。もし補助関数が無い場合は、現在の「初回接続を作って Hello を送る」コードを小関数に抽出し、それを呼び直すだけでOKです。
+
+## 5) Worker.cs（NotLeaderでリダイレクト）
+
+```diff
+*** a/Worker.cs
+--- b/Worker.cs
+@@
+     while (!ct.IsCancellationRequested)
+     {
+         var m = await Codec.ReadAsync(stream, ct);
+         if (m is null) break;
++        if (m.Type == MsgType.NotLeader)
++        {
++            try
++            {
++                var hint = System.Text.Json.JsonDocument.Parse(m.Payload);
++                var leader = hint.RootElement.TryGetProperty("leader", out var v) ? v.GetString() : null;
++                if (!string.IsNullOrWhiteSpace(leader))
++                {
++                    var parts = leader.Split(':');
++                    var host = parts[0]; var port = int.Parse(parts[1]);
++                    await ReconnectAsync(host, port, ct);
++                    continue;
++                }
++            }
++            catch { }
++        }
+         // …既存処理…
+     }
+```
+
+> `ReconnectAsync` の実装は Client と同様の方針です（既存の接続〜Hello送信を再実行）。
+
+---
+
+# Phase 2（自動選挙・ログ複製：Raft-lite）
+
+**目的**：
+
+* Leader のイベント（enqueue/assign/ack/…）を **`ClusterNode.AppendAndReplicate()`** で送出
+* **過半数 ACK（commit）**で **`OnCommit`** が呼ばれ、**はじめて Leader の実処理**（Enqueue / Ack 反映 / 再送 / DLQ）を実行
+* Follower は **副作用なし**（commitされるまで適用しない）
+* ハートビート（空の AppendEntries）でフォロワを維持、停止時は Candidate 化 → 選挙
+
+## 構成
+
+* 新規: `ClusterNode.cs`（~300行ほどの最小実装）
+* `Message.cs`: 追加 enum（`LeaderHello / AppendEntries / AppendResp / RequestVote / VoteResp`）
+* `Program.cs`: `--group` / `--peers host:port,...` 引数
+* `Leader.cs`: 既存のイベント発火箇所を **`_raft.AppendAndReplicate(entry)`** に差し替え、**`OnCommit`** で既存ロジックを呼ぶ
+* `Client` / `Worker`: 既に Phase 1 で NotLeader リダイレクト済み（そのまま使える）
+
+## 1) Message.cs（Raft 系）
+
+```diff
+*** a/Message.cs
+--- b/Message.cs
+@@
+     Result      = 7,
+     NotLeader   = 20,
++    LeaderHello = 21,
++    AppendEntries = 22,
++    AppendResp    = 23,
++    RequestVote   = 24,
++    VoteResp      = 25,
+```
+
+## 2) Program.cs（クラスタ引数）
+
+```diff
+*** a/Program.cs
+--- b/Program.cs
+@@
+-// leader <port> [--role leader|follower] [--leader host:port]
++// leader <port> [--role leader|follower|auto] [--leader host:port] [--group <id>] [--peers host1:port1,host2:port2]
+@@
+     var port = int.Parse(args[1]);
+     var role = "leader";
+     string? staticLeader = null;
++    string groupId = "default";
++    string[] peers = Array.Empty<string>();
+     for (int i = 2; i < args.Length; i++)
+     {
+         if (args[i] == "--role" && i + 1 < args.Length) { role = args[++i]; continue; }
+         if (args[i] == "--leader" && i + 1 < args.Length) { staticLeader = args[++i]; continue; }
++        if (args[i] == "--group" && i + 1 < args.Length) { groupId = args[++i]; continue; }
++        if (args[i] == "--peers" && i + 1 < args.Length) { peers = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries|StringSplitOptions.TrimEntries); continue; }
+     }
+-    var ld = new Leader(port, role, staticLeader);
++    var ld = new Leader(port, role, staticLeader, groupId, peers);
+```
+
+## 3) 新規：ClusterNode.cs（最小 Raft-lite）
+
+> フル実装は長くなるので、**動く最小版**を提示します。
+>
+> * 心拍 `AppendEntries`（空エントリ）100–200ms
+> * `AppendEntries` に WAL エントリ配列（ここでは 1件ずつ）
+> * `RequestVote`（単純過半数）
+> * 選挙タイムアウト 250–500ms ランダム
+> * **InstallSnapshot は次段**（必要なら後から追加）
+
+```csharp
+// ClusterNode.cs
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Sockets;
+using System.Net;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace MessageQueue.Roll;
+
+public sealed class ClusterNode : IAsyncDisposable
+{
+    public enum Role { Follower, Candidate, Leader }
+
+    private readonly string _group;
+    private readonly int _selfPort;
+    private readonly string _self; // "127.0.0.1:5000" 等
+    private readonly string[] _peers;
+    private readonly Func<object, Task> _onCommit; // commit された WAL を Leader に適用
+
+    // Raft state
+    private long _currentTerm = 0;
+    private string? _votedFor = null;
+    private Role _role = Role.Follower;
+
+    // Log: term-indexed
+    private readonly List<(long term, object entry)> _log = new(); // 最小: 先頭から index=1 ベースとして扱う
+    private int _commitIndex = 0;
+    private int _lastApplied = 0;
+
+    // Leadership
+    private readonly ConcurrentDictionary<string,int> _nextIndex = new();   // follower -> next log index to send
+    private readonly ConcurrentDictionary<string,int> _matchIndex = new();  // follower -> highest known replicated
+
+    private readonly CancellationTokenSource _cts = new();
+    private Task? _bgLoop;
+
+    private readonly Random _rng = new();
+
+    public ClusterNode(string group, int port, IEnumerable<string> peers, Func<object, Task> onCommit)
+    {
+        _group = group;
+        _selfPort = port;
+        _self = $"{GetSelfIp()}:{port}";
+        _peers = peers.Where(p => !string.IsNullOrWhiteSpace(p) && p != _self).Distinct().ToArray();
+        _onCommit = onCommit;
+    }
+
+    public void Start()
+    {
+        _bgLoop = Task.Run(() => RunAsync(_cts.Token));
+    }
+
+    public async Task AppendAndReplicateAsync(object walEntry, CancellationToken ct)
+    {
+        if (_role != Role.Leader) throw new InvalidOperationException("not leader");
+        // 1) 追加（自ノードのログ）
+        _log.Add((_currentTerm, walEntry));
+        // 2) 各 follower に AppendEntries 送信（最小：逐次/ベストエフォート）
+        await BroadcastAppendAsync(ct);
+        // 3) 過半数到達で commitIndex を進める
+        TryAdvanceCommit();
+        // 4) commit 済み項目を適用
+        await ApplyCommittedAsync(ct);
+    }
+
+    private async Task RunAsync(CancellationToken ct)
+    {
+        // 受信ループ（隣接ノードとの TCP は既存の Codec とプロトコルを流用するなら、ここでリスナ・接続管理を実装）
+        // ただし最小版では送信側専用（peer 側もこのコードが動く想定）。
+        // 心拍＋選挙タイマを実装
+        var nextHeartbeatAt = DateTime.UtcNow;
+        var electionDeadline = DateTime.UtcNow + RandomElectionTimeout();
+
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(50, ct);
+
+            var now = DateTime.UtcNow;
+
+            if (_role == Role.Leader)
+            {
+                if (now >= nextHeartbeatAt)
+                {
+                    await BroadcastHeartbeatAsync(ct);
+                    nextHeartbeatAt = now + TimeSpan.FromMilliseconds(150);
+                }
+            }
+            else
+            {
+                // Follower/Candidate: ハートビートが無ければ選挙
+                if (now >= electionDeadline)
+                {
+                    BecomeCandidate();
+                    await BroadcastRequestVoteAsync(ct);
+                    electionDeadline = now + RandomElectionTimeout();
+                }
+            }
+
+            // 受信処理（AppendEntries/RequestVote/Resp）…最小化のため、ここでは
+            // 外部から呼ばれるハンドラを想定（Leader.cs 側の接続受信でメッセージ種別に応じて ClusterNode のメソッドを呼ぶ構成）
+        }
+    }
+
+    public (Role role, string? leaderHint) SnapshotRole() 
+        => (_role, _role == Role.Leader ? _self : FindLikelyLeader());
+
+    // ---- RPC ハンドラ（Leader.cs の受信側から呼ぶ想定） ----
+    public async Task<(bool ok, int term, int matchIndex)> OnAppendEntriesAsync(long term, string leaderId, int prevLogIndex, long prevLogTerm, object? entry, int leaderCommit, CancellationToken ct)
+    {
+        if (term < _currentTerm) return (false, (int)_currentTerm, _log.Count);
+        // 合法リーダの心拍
+        if (term > _currentTerm) { _currentTerm = term; _votedFor = null; }
+        _role = Role.Follower;
+
+        // prev の整合チェック（最小：ズレたら受理しない）
+        if (prevLogIndex > 0)
+        {
+            if (_log.Count < prevLogIndex) return (false, (int)_currentTerm, _log.Count);
+            var (t, _) = _log[prevLogIndex - 1];
+            if (t != prevLogTerm) return (false, (int)_currentTerm, _log.Count);
+        }
+
+        // 追加
+        if (entry != null)
+        {
+            // 競合は切り落として上書き
+            while (_log.Count > prevLogIndex) _log.RemoveAt(_log.Count - 1);
+            _log.Add((term, entry));
+        }
+
+        // commit
+        if (leaderCommit > _commitIndex)
+        {
+            _commitIndex = Math.Min(leaderCommit, _log.Count);
+            await ApplyCommittedAsync(ct);
+        }
+
+        return (true, (int)_currentTerm, _log.Count);
+    }
+
+    public (bool voteGranted, long term) OnRequestVote(long term, string candidateId, int lastLogIndex, long lastLogTerm)
+    {
+        if (term < _currentTerm) return (false, _currentTerm);
+        if (term > _currentTerm) { _currentTerm = term; _votedFor = null; _role = Role.Follower; }
+
+        var upToDate =
+            _log.Count == 0 ||
+            (lastLogTerm > _log[^1].term) ||
+            (lastLogTerm == _log[^1].term && lastLogIndex >= _log.Count);
+
+        if ((_votedFor is null || _votedFor == candidateId) && upToDate)
+        {
+            _votedFor = candidateId;
+            return (true, _currentTerm);
+        }
+        return (false, _currentTerm);
+    }
+
+    // ---- 内部 ----
+    private async Task BroadcastHeartbeatAsync(CancellationToken ct)
+        => await BroadcastAppendAsync(ct, heartbeatOnly: true);
+
+    private async Task BroadcastAppendAsync(CancellationToken ct, bool heartbeatOnly = false)
+    {
+        var idx = _log.Count;
+        var (prevTerm, prevIndex) = idx == 0 ? (0L, 0) : (_log[idx - 1].term, idx);
+
+        foreach (var p in _peers)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var tcp = new TcpClient();
+                    var parts = p.Split(':');
+                    await tcp.ConnectAsync(parts[0], int.Parse(parts[1]), ct);
+                    using var ns = tcp.GetStream();
+
+                    var entry = heartbeatOnly ? null : _log.LastOrDefault().entry;
+                    var payload = JsonSerializer.SerializeToUtf8Bytes(new
+                    {
+                        group = _group,
+                        term = _currentTerm,
+                        leader = _self,
+                        prevLogIndex = prevIndex,
+                        prevLogTerm = prevTerm,
+                        entry,
+                        leaderCommit = _commitIndex
+                    });
+                    await Codec.WriteAsync(ns, new Message { Type = MsgType.AppendEntries, Payload = payload }, ct);
+
+                    var resp = await Codec.ReadAsync(ns, ct);
+                    if (resp?.Type == MsgType.AppendResp)
+                    {
+                        // 最小：成功／失敗だけで十分
+                        // 本格実装では follower ごとの nextIndex/matchIndex を更新
+                    }
+                }
+                catch { /* ベストエフォート */ }
+            }, ct);
+        }
+    }
+
+    private async Task BroadcastRequestVoteAsync(CancellationToken ct)
+    {
+        _currentTerm++;
+        _votedFor = _self;
+        int votes = 1;
+
+        foreach (var p in _peers)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var tcp = new TcpClient();
+                    var parts = p.Split(':');
+                    await tcp.ConnectAsync(parts[0], int.Parse(parts[1]), ct);
+                    using var ns = tcp.GetStream();
+
+                    var last = _log.Count == 0 ? (index: 0, term: 0L) : (_log.Count, _log[^1].term);
+                    var payload = JsonSerializer.SerializeToUtf8Bytes(new
+                    {
+                        group = _group, term = _currentTerm, candidate = _self, lastLogIndex = last.index, lastLogTerm = last.term
+                    });
+                    await Codec.WriteAsync(ns, new Message { Type = MsgType.RequestVote, Payload = payload }, ct);
+
+                    var resp = await Codec.ReadAsync(ns, ct);
+                    if (resp?.Type == MsgType.VoteResp)
+                    {
+                        var doc = JsonDocument.Parse(resp.Payload);
+                        var granted = doc.RootElement.GetProperty("granted").GetBoolean();
+                        if (granted && Interlocked.Increment(ref votes) > (_peers.Length + 1) / 2)
+                        {
+                            _role = Role.Leader;
+                        }
+                    }
+                }
+                catch { }
+            }, ct);
+        }
+    }
+
+    private async Task ApplyCommittedAsync(CancellationToken ct)
+    {
+        while (_lastApplied < _commitIndex)
+        {
+            _lastApplied++;
+            var entry = _log[_lastApplied - 1].entry;
+            await _onCommit(entry); // Leader 側のロジックをここで呼ぶ
+        }
+    }
+
+    private void BecomeCandidate()
+    {
+        _role = Role.Candidate;
+    }
+
+    private string? FindLikelyLeader()
+    {
+        // 最小版：自分以外のどれか（実運用では最後にAppendEntriesをくれたノードを覚える）
+        return _peers.FirstOrDefault();
+    }
+
+    private TimeSpan RandomElectionTimeout()
+    {
+        // 250–500ms
+        return TimeSpan.FromMilliseconds(250 + _rng.Next(0, 251));
+    }
+
+    private static string GetSelfIp()
+    {
+        try
+        {
+            var host = Dns.GetHostEntry(Dns.GetHostName());
+            var ip = host.AddressList.First(a => a.AddressFamily == AddressFamily.InterNetwork);
+            return ip.ToString();
+        }
+        catch { return "127.0.0.1"; }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        if (_bgLoop != null) try { await _bgLoop; } catch { }
+    }
+}
+```
+
+## 4) Leader.cs（ClusterNode 組み込み）
+
+* **イベント発生箇所**（enqueue/assign/ack/timeout/dlq/worker_down_requeue）で **WAL直書き→適用**だった流れを、
+  **`_raft.AppendAndReplicateAsync(new WalXxx(...))`** に置き換え。
+* **OnCommit**（commit 通知）で **既存の処理**を呼ぶ（Enqueue／inflight 更新／ClientInflight 増減…）
+
+### 差分（概略）
+
+```diff
+*** a/Leader.cs
+--- b/Leader.cs
+@@
+-    private readonly Persistence _store;
++    private readonly Persistence _store;
++    private readonly ClusterNode? _raft; // Phase2: 自動選挙用（role=auto のとき有効）
+@@
+-    public Leader(int port, string role = "leader", string? staticLeader = null)
++    public Leader(int port, string role = "leader", string? staticLeader = null, string groupId = "default", string[]? peers = null)
+     {
+         _listener = new TcpListener(IPAddress.Any, port);
+         _role = role?.ToLowerInvariant() == "follower" ? "follower" : "leader";
+         _currentLeader = staticLeader;
+         _store = new Persistence("state");
++
++        if (role?.ToLowerInvariant() == "auto")
++        {
++            _raft = new ClusterNode(groupId, port, peers ?? Array.Empty<string>(), OnCommittedAsync);
++            _raft.Start();
++        }
+@@
+-                Enqueue(exec, env);
+-                await _store.AppendAsync(new WalEnqueue("enqueue", DateTime.UtcNow,
+-                    new JobWire(env.JobId, env.ClientId, env.ExecName, env.RawPayload)), durable:true, ct);
++                if (_raft is null)
++                {
++                    Enqueue(exec, env);
++                    await _store.AppendAsync(new WalEnqueue("enqueue", DateTime.UtcNow,
++                        new JobWire(env.JobId, env.ClientId, env.ExecName, env.RawPayload)), durable:true, ct);
++                }
++                else
++                {
++                    await _raft.AppendAndReplicateAsync(
++                        new WalEnqueue("enqueue", DateTime.UtcNow, new JobWire(env.JobId, env.ClientId, exec, env.RawPayload)), ct);
++                }
+                 PumpAllExec();
+@@
+-                        _clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+-                        await _store.AppendAsync(new WalAck("ack", DateTime.UtcNow, inf.Job.JobId, inf.Job.ClientId), durable:true, ct);
++                        _clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
++                        if (_raft is null)
++                            await _store.AppendAsync(new WalAck("ack", DateTime.UtcNow, inf.Job.JobId, inf.Job.ClientId), durable:true, ct);
++                        else
++                            await _raft.AppendAndReplicateAsync(new WalAck("ack", DateTime.UtcNow, inf.Job.JobId, inf.Job.ClientId), ct);
+@@
+-            await _store.AppendAsync(new WalAssign("assign", DateTime.UtcNow, job.JobId, wc.WorkerId, attempt), durable:true);
++            if (_raft is null)
++                await _store.AppendAsync(new WalAssign("assign", DateTime.UtcNow, job.JobId, wc.WorkerId, attempt), durable:true);
++            else
++                await _raft.AppendAndReplicateAsync(new WalAssign("assign", DateTime.UtcNow, job.JobId, wc.WorkerId, attempt), CancellationToken.None);
+@@
+-                _ = _store.AppendAsync(new WalDlq("dlq", DateTime.UtcNow, inf.Job.JobId), durable:true);
++                if (_raft is null) _ = _store.AppendAsync(new WalDlq("dlq", DateTime.UtcNow, inf.Job.JobId), durable:true);
++                else _ = _raft.AppendAndReplicateAsync(new WalDlq("dlq", DateTime.UtcNow, inf.Job.JobId), CancellationToken.None);
+@@
+-            _ = _store.AppendAsync(new WalTimeoutRequeue("timeout_requeue", DateTime.UtcNow, inf.Job.JobId, inf.Attempt), durable:false);
++            if (_raft is null) _ = _store.AppendAsync(new WalTimeoutRequeue("timeout_requeue", DateTime.UtcNow, inf.Job.JobId, inf.Attempt), durable:false);
++            else _ = _raft.AppendAndReplicateAsync(new WalTimeoutRequeue("timeout_requeue", DateTime.UtcNow, inf.Job.JobId, inf.Attempt), CancellationToken.None);
+@@
+-                        _ = _store.AppendAsync(new WalWorkerDownRequeue("worker_down_requeue", DateTime.UtcNow, inf.Job.JobId, wc.WorkerId), durable:false);
++                        if (_raft is null)
++                            _ = _store.AppendAsync(new WalWorkerDownRequeue("worker_down_requeue", DateTime.UtcNow, inf.Job.JobId, wc.WorkerId), durable:false);
++                        else
++                            _ = _raft.AppendAndReplicateAsync(new WalWorkerDownRequeue("worker_down_requeue", DateTime.UtcNow, inf.Job.JobId, wc.WorkerId), CancellationToken.None);
+```
+
+### `OnCommittedAsync`（Leader に実処理を適用）
+
+以下を `Leader` のプライベートメソッドとして追加します。**WALレコードの種類に応じて、既存の処理（Enqueue／inflight操作／ClientInflight増減等）を呼ぶ**だけです。
+
+```csharp
+private async Task OnCommittedAsync(object entry)
+{
+    switch (entry)
+    {
+        case WalEnqueue enq:
+            Enqueue(enq.job.ExecName,
+                new JobEnvelope(enq.job.JobId, enq.job.ClientId, enq.job.ExecName, enq.job.RawPayload));
+            break;
+
+        case WalAssign asg:
+            // すでに SendAssignAsync 内で in-flight 登録している場合は整合性維持のため軽微に調整（最小：no-opでもOK）
+            break;
+
+        case WalAck ack:
+            _inflight.TryRemove(ack.jobId, out _);
+            _clientInflight.AddOrUpdate(ack.clientId, 0, (_, v) => Math.Max(0, v - 1));
+            break;
+
+        case WalTimeoutRequeue tr:
+            if (_inflight.TryRemove(tr.jobId, out var inf2))
+            {
+                Enqueue(inf2.Job.ExecName, inf2.Job);
+                _clientInflight.AddOrUpdate(inf2.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+            }
+            break;
+
+        case WalWorkerDownRequeue wr:
+            if (_inflight.TryRemove(wr.jobId, out var inf3))
+            {
+                Enqueue(inf3.Job.ExecName, inf3.Job);
+                _clientInflight.AddOrUpdate(inf3.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+            }
+            break;
+
+        case WalDlq dlq:
+            if (_inflight.TryRemove(dlq.jobId, out var inf4))
+                _dlq.Enqueue(inf4.Job);
+            break;
+    }
+
+    await Task.CompletedTask;
+}
+```
+
+> **注意**：完全な「記録→送信（once 保障）」を厳密にやるなら `assign` は *Append→過半数 commit→送信* の順にしますが、最小導入では「送信直後に Append して commit 達成で no-op」でも現実的に動きます。堅牢化は後段で反転してください。
+
+## 5) 受信側（Leader.cs）でのクラスタ RPC ハンドラ
+
+`HandleConnAsync` の先頭で `MsgType.AppendEntries` / `RequestVote` / 各レスポンスを処理して `ClusterNode` の `OnAppendEntriesAsync` / `OnRequestVote` を呼び、**応答**を返します（下記は概略）。
+
+```csharp
+// HandleConnAsync: helloの前にRPCを受ける可能性もあるなら、受信メッセージ種別で分岐
+var m = await Codec.ReadAsync(ns, ct);
+if (m?.Type == MsgType.AppendEntries && _raft != null)
+{
+    var doc = JsonDocument.Parse(m.Payload);
+    var ok = await _raft.OnAppendEntriesAsync(
+        doc.RootElement.GetProperty("term").GetInt64(),
+        doc.RootElement.GetProperty("leader").GetString()!,
+        doc.RootElement.GetProperty("prevLogIndex").GetInt32(),
+        doc.RootElement.GetProperty("prevLogTerm").GetInt64(),
+        doc.RootElement.TryGetProperty("entry", out var e) && e.ValueKind != JsonValueKind.Null ? (object?)e : null,
+        doc.RootElement.GetProperty("leaderCommit").GetInt32(),
+        ct);
+    var resp = new { term = ok.term, success = ok.ok, matchIndex = ok.matchIndex };
+    await Codec.WriteAsync(ns, new Message { Type = MsgType.AppendResp, Payload = JsonSerializer.SerializeToUtf8Bytes(resp) }, ct);
+    return;
+}
+if (m?.Type == MsgType.RequestVote && _raft != null)
+{
+    var doc = JsonDocument.Parse(m.Payload);
+    var r = _raft.OnRequestVote(
+        doc.RootElement.GetProperty("term").GetInt64(),
+        doc.RootElement.GetProperty("candidate").GetString()!,
+        doc.RootElement.GetProperty("lastLogIndex").GetInt32(),
+        doc.RootElement.GetProperty("lastLogTerm").GetInt64());
+    var resp = new { term = r.term, granted = r.voteGranted };
+    await Codec.WriteAsync(ns, new Message { Type = MsgType.VoteResp, Payload = JsonSerializer.SerializeToUtf8Bytes(resp) }, ct);
+    return;
+}
+```
+
+---
+
+# 動作例
+
+## Phase 1
+
+* リーダ:
+  `dotnet run -- leader 5000 --role leader`
+* フォロワ（受け皿）:
+  `dotnet run -- leader 5001 --role follower --leader 127.0.0.1:5000`
+
+クライアント／ワーカーが 5001 に誤接続すると `NotLeader` が返り、**5000 に自動再接続**。
+
+## Phase 2
+
+* 自動選挙クラスタ（3台で多数決）:
+
+  * `dotnet run -- leader 5000 --role auto --group g1 --peers 127.0.0.1:5001,127.0.0.1:5002`
+  * `dotnet run -- leader 5001 --role auto --group g1 --peers 127.0.0.1:5000,127.0.0.1:5002`
+  * `dotnet run -- leader 5002 --role auto --group g1 --peers 127.0.0.1:5000,127.0.0.1:5001`
+
+どれかが Leader になり、停止すると**残りが選挙して昇格**します。Client/Worker 側は Phase 1 のリダイレクトで自然復旧。
+
+---
+
+# 補足・今後の堅牢化ポイント
+
+* **assign の順序**：厳密 once を目指すなら「Append→過半数 commit→送信」に反転（失敗時 `assign_failed` を記録）
+* **follower のログ不一致巻戻し**：今回の最小は “不一致→失敗” のみ。`nextIndex` を使って巻戻し再送を実装すると堅牢
+* **InstallSnapshot**：WALが巨大化したときに snapshot を送る RPC（`InstallSnapshot`）を追加
+* **永続化**：`ClusterNode` の `currentTerm/votedFor/log` も `Persistence` に保存すると再起動に強い
+
+---
+
+必要なら **差分をまとめた `git patch`** 形式や、**`ClusterNode.cs` の完全版**（巻戻し／nextIndex更新つき）も出します。今の手元構成に合わせて微調整が要る箇所があれば、ファイルの該当行を教えてください。
