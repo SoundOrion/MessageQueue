@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics.Metrics;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -223,11 +224,41 @@ public sealed class Leader
             switch (m.Type)
             {
                 case MsgType.Credit:
-                    int n = 1;
-                    if (m.Payload is { Length: 4 })
-                        n = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(m.Payload);
-                    wc.Credit += Math.Max(1, n);
-                    PumpAllExec();
+                    {
+                        // --- 強化版 Credit 反映 ---
+                        // 1) payload から int32LE を安全に読取
+                        int delta = 1;
+                        if (m.Payload is { Length: 4 })
+                        {
+                            delta = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(m.Payload);
+                        }
+                        else if (m.Payload is { Length: > 0 })
+                        {
+                            // 4byte 以外は不正として無視（ログのみ）
+                            Console.WriteLine($"[Leader] invalid credit payload len={m.Payload.Length} from {wc.WorkerId}");
+                            break;
+                        }
+
+                        // 2) 不正/極端な値のガード
+                        //    - 0以下は無視
+                        //    - 上限を設ける（偶発/悪意の過大Credit抑制）
+                        const int MaxCreditPerMessage = 10_000;
+                        if (delta <= 0) break;
+                        if (delta > MaxCreditPerMessage) delta = MaxCreditPerMessage;
+
+                        // 3) 競合に強い加算
+                        int after = System.Threading.Interlocked.Add(ref wc.Credit, delta);
+                        // underflow/overflow の保険（理論上 after < 0 にはならないが念のため）
+                        if (after < 0)
+                        {
+                            // 異常値を検知したら 0 に補正
+                            System.Threading.Interlocked.Exchange(ref wc.Credit, 0);
+                            Console.WriteLine($"[Leader] credit underflow fixed for {wc.WorkerId}");
+                        }
+
+                        // 4) 実際に増えたらスケジューリングを回す
+                        PumpAllExec();
+                    }
                     break;
 
                 case MsgType.AckJob:
