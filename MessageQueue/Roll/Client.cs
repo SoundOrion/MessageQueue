@@ -17,14 +17,13 @@ public sealed class Client
 
         await Codec.WriteAsync(ns, new Message { Type = MsgType.HelloClient }, ct);
 
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 10; i++)
         {
-            var jobId = Guid.NewGuid(); // Job単位のID
+            var jobId = Guid.NewGuid();
             var payload = Encoding.UTF8.GetBytes($"job-{i}");
             await Codec.WriteAsync(ns, new Message { Type = MsgType.SubmitJob, MsgId = jobId, Payload = payload }, ct);
-
-            // 仮に同じものをもう一度送っても、Leader 側で重複無視
-            // await Codec.WriteAsync(ns, new Message { Type = MsgType.SubmitJob, MsgId = jobId, Payload = payload }, ct);
+            Console.WriteLine($"[Client] Submitted {jobId} ({payload.Length}B)");
         }
     }
 }
+

@@ -1,22 +1,38 @@
-﻿using MessageQueue;
-using MessageQueue.Roll;
+﻿using MessageQueue.Roll;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 
-var cts = new CancellationTokenSource();
+namespace MessageQueue;
 
-var leader = new Leader(port: 5000);
-_ = Task.Run(() => leader.RunAsync(cts.Token));
+public static class Program
+{
+    public static async Task Main()
+    {
+        var cts = new CancellationTokenSource();
 
-// 少し待ってからWorker/Client起動
-await Task.Delay(200);
+        var leader = new Leader(port: 5000);
+        _ = Task.Run(() => leader.RunAsync(cts.Token));
 
-var worker = new Worker("127.0.0.1", 5000);
-_ = Task.Run(() => worker.RunAsync(cts.Token));
+        await Task.Delay(200);
 
-await Task.Delay(200);
+        // 複数ワーカー起動
+        for (int i = 0; i < 3; i++)
+        {
+            _ = Task.Run(async () =>
+            {
+                var w = new Worker("127.0.0.1", 5000);
+                await w.RunAsync(cts.Token);
+            });
+        }
 
-var client = new Client("127.0.0.1", 5000);
-await client.RunAsync(cts.Token);
+        await Task.Delay(400);
 
-// Ctrl+C 等で終了させる想定
-Console.ReadLine();
-cts.Cancel();
+        var client = new Client("127.0.0.1", 5000);
+        await client.RunAsync(cts.Token);
+
+        Console.WriteLine("Press ENTER to stop...");
+        Console.ReadLine();
+        cts.Cancel();
+    }
+}

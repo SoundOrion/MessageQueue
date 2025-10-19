@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+
 namespace MessageQueue.Roll;
 
 public sealed class Leader
@@ -9,10 +10,10 @@ public sealed class Leader
     private readonly TcpListener _listener;
     private readonly ConcurrentQueue<JobEnvelope> _queue = new();
     private readonly ConcurrentDictionary<Guid, Inflight> _inflight = new();
-    private readonly HashSet<Guid> _submitted = new(); // lockで保護
+    private readonly HashSet<Guid> _submitted = new();         // Submit重複排除
+    private readonly Dictionary<Guid, WorkerConn> _workers = new();
     private readonly object _lock = new();
 
-    private readonly List<WorkerConn> _workers = new(); // 最小：単純管理
     private readonly System.Timers.Timer _retransmitTimer;
 
     public Leader(int port)
@@ -27,7 +28,7 @@ public sealed class Leader
     {
         _listener.Start();
         _retransmitTimer.Start();
-        Console.WriteLine("Leader listening...");
+        Console.WriteLine("[Leader] listening...");
         while (!ct.IsCancellationRequested)
         {
             var client = await _listener.AcceptTcpClientAsync(ct);
@@ -45,18 +46,39 @@ public sealed class Leader
 
         if (hello.Type == MsgType.HelloClient)
         {
+            Console.WriteLine("[Leader] Client connected");
             await HandleSubmitterAsync(ns, ct);
         }
         else if (hello.Type == MsgType.HelloWorker)
         {
-            var wc = new WorkerConn(ns);
-            lock (_lock) _workers.Add(wc);
-            try { await HandleWorkerAsync(wc, ct); }
-            finally { lock (_lock) _workers.Remove(wc); }
+            var workerId = hello.MsgId;                 // Worker が名乗る GUID
+            var wc = new WorkerConn(workerId, ns);
+            lock (_lock) _workers[workerId] = wc;
+
+            Console.WriteLine($"[Leader] Worker connected: {workerId}");
+
+            try
+            {
+                await HandleWorkerAsync(wc, ct);
+            }
+            finally
+            {
+                // 切断
+                lock (_lock) _workers.Remove(workerId);
+
+                // そのWorkerが持っていたin-flightを再キュー
+                foreach (var kv in _inflight.Where(kv => ReferenceEquals(kv.Value.Owner, wc)).ToArray())
+                {
+                    if (_inflight.TryRemove(kv.Key, out var inf))
+                    {
+                        _queue.Enqueue(inf.Job);
+                        Console.WriteLine($"[Leader] Requeued {inf.Job.JobId} (owner disconnected)");
+                    }
+                }
+            }
         }
     }
 
-    // Client -> SubmitJob（重複排除）
     private async Task HandleSubmitterAsync(NetworkStream ns, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -69,18 +91,19 @@ public sealed class Leader
             {
                 if (_submitted.Contains(m.MsgId))
                 {
-                    Console.WriteLine($"Duplicate submit ignored: {m.MsgId}");
+                    Console.WriteLine($"[Leader] Duplicate submit ignored: {m.MsgId}");
                     continue;
                 }
                 _submitted.Add(m.MsgId);
             }
+
             _queue.Enqueue(new JobEnvelope(m.MsgId, m.Payload));
-            TryAssign(); // すぐ割当を試みる
-            Console.WriteLine($"Enqueued job {m.MsgId} len={m.Payload.Length}");
+            Console.WriteLine($"[Leader] Enqueued job {m.MsgId} len={m.Payload.Length}");
+
+            TryAssign(); // すぐ配る
         }
     }
 
-    // Worker -> Credit / Ack
     private async Task HandleWorkerAsync(WorkerConn wc, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -88,38 +111,46 @@ public sealed class Leader
             var m = await Codec.ReadAsync(wc.Stream, ct);
             if (m is null) break;
 
-            if (m.Type == MsgType.Credit)
+            switch (m.Type)
             {
-                wc.Credit++;
-                TryAssign();
-            }
-            else if (m.Type == MsgType.AckJob)
-            {
-                // corrId = JobId
-                if (_inflight.TryRemove(m.CorrId, out var inflight))
-                {
-                    Console.WriteLine($"Ack {m.CorrId} from worker");
-                    inflight.Owner.Credit++;          // 枠回復（割り当て中に減らしている場合）
-                    inflight.Owner.Running--;         // 実行数減少
-                }
+                case MsgType.Credit:
+                    wc.Credit++;           // 細かく見るなら m.Payload の Int32 を加算
+                    TryAssign();
+                    break;
+
+                case MsgType.AckJob:
+                    if (_inflight.TryRemove(m.CorrId, out var inf))
+                    {
+                        wc.Credit++;
+                        wc.Running--;
+                        Console.WriteLine($"[Leader] Ack {m.CorrId} from {wc.WorkerId}");
+                    }
+                    break;
             }
         }
+        Console.WriteLine($"[Leader] Worker disconnected: {wc.WorkerId}");
     }
 
-    // 割当（最小：先頭ジョブを、最初に空いてるワーカーへ）
     private void TryAssign()
     {
-        if (_queue.IsEmpty) return;
-        WorkerConn? target = null;
-        lock (_lock)
+        while (!_queue.IsEmpty)
         {
-            target = _workers.FirstOrDefault(w => w.Credit > 0);
-        }
-        if (target is null) return;
+            WorkerConn? target;
+            lock (_lock)
+            {
+                target = _workers.Values
+                    .Where(w => w.Credit > 0)
+                    .OrderByDescending(w => w.Credit)
+                    .ThenBy(w => w.Running)
+                    .FirstOrDefault();
+            }
+            if (target is null) break;
 
-        if (_queue.TryDequeue(out var job))
-        {
-            SendAssign(target, job, attempt: 1);
+            if (_queue.TryDequeue(out var job))
+            {
+                SendAssign(target, job, attempt: 1);
+            }
+            else break;
         }
     }
 
@@ -127,7 +158,6 @@ public sealed class Leader
     {
         try
         {
-            var now = DateTime.UtcNow;
             var msg = new Message
             {
                 Type = MsgType.AssignJob,
@@ -136,61 +166,61 @@ public sealed class Leader
                 Payload = job.Payload
             };
             await Codec.WriteAsync(wc.Stream, msg, CancellationToken.None);
+
             wc.Credit--;
             wc.Running++;
 
-            _inflight[job.JobId] = new Inflight(job, wc, SentAt: now, Attempt: attempt);
-            Console.WriteLine($"Assigned {job.JobId} (try={attempt})");
+            _inflight[job.JobId] = new Inflight(job, wc, SentAt: DateTime.UtcNow, Attempt: attempt);
+            Console.WriteLine($"[Leader] Assigned {job.JobId} to {wc.WorkerId} (try={attempt})");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Assign failed: {ex.Message}. Requeue {job.JobId}");
+            Console.WriteLine($"[Leader] Assign failed: {ex.Message}. Requeue {job.JobId}");
             _queue.Enqueue(job);
         }
     }
 
-    // タイムアウト監視 → 再送or再キュー
     private void CheckTimeouts()
     {
         var now = DateTime.UtcNow;
         foreach (var kv in _inflight.ToArray())
         {
             var inf = kv.Value;
-            var elapsed = now - inf.SentAt;
-            var timeout = TimeSpan.FromSeconds(5); // 仮のACK待ち時間
-            if (elapsed < timeout) continue;
+            if (now - inf.SentAt < TimeSpan.FromSeconds(5)) continue; // ACK待ち
 
             if (_inflight.TryRemove(inf.Job.JobId, out _))
             {
-                if (inf.Attempt >= 5)
+                // 別Workerを優先
+                WorkerConn? target;
+                lock (_lock)
                 {
-                    Console.WriteLine($"Job {inf.Job.JobId} exceeded retries. Requeue.");
-                    _queue.Enqueue(inf.Job);
+                    target = _workers.Values
+                        .Where(w => w.Credit > 0 && !ReferenceEquals(w, inf.Owner))
+                        .OrderByDescending(w => w.Credit).ThenBy(w => w.Running)
+                        .FirstOrDefault() ?? inf.Owner;
                 }
-                else
-                {
-                    // 同じワーカーでもよいが、空いている別ワーカーがいればそちらへ
-                    WorkerConn? target;
-                    lock (_lock)
-                    {
-                        target = _workers
-                            .OrderByDescending(w => w.Credit) // 簡易
-                            .FirstOrDefault(w => w.Credit > 0 && !object.ReferenceEquals(w, inf.Owner))
-                            ?? inf.Owner; // fallback
-                    }
-                    SendAssign(target!, inf.Job, inf.Attempt + 1);
-                }
+                Console.WriteLine($"[Leader] Retransmit {inf.Job.JobId} (next try={inf.Attempt + 1})");
+                SendAssign(target!, inf.Job, inf.Attempt + 1);
             }
         }
     }
 
     private sealed record JobEnvelope(Guid JobId, byte[] Payload);
     private sealed record Inflight(JobEnvelope Job, WorkerConn Owner, DateTime SentAt, int Attempt);
+
     private sealed class WorkerConn
     {
+        public Guid WorkerId { get; }
         public NetworkStream Stream { get; }
         public int Credit;
         public int Running;
-        public WorkerConn(NetworkStream s) { Stream = s; Credit = 0; Running = 0; }
+
+        public WorkerConn(Guid workerId, NetworkStream stream)
+        {
+            WorkerId = workerId;
+            Stream = stream;
+            Credit = 0;
+            Running = 0;
+        }
     }
 }

@@ -5,9 +5,11 @@ namespace MessageQueue.Common;
 
 public static class Codec
 {
+    // Frame: [len:4LE][type:1][msgId:16][corrId:16][payloadLen:4LE][payload:...]
     public static async Task WriteAsync(NetworkStream ns, Message m, CancellationToken ct)
     {
         int bodyLen = 1 + 16 + 16 + 4 + m.Payload.Length;
+
         var len = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(len, bodyLen);
         await ns.WriteAsync(len, ct);
@@ -33,6 +35,12 @@ public static class Codec
         var body = await ReadExactAsync(ns, bodyLen, ct);
         if (body is null) return null;
 
+        return ParseBody(body);
+    }
+
+    // 非asyncに切り出し（Span OK）
+    private static Message ParseBody(byte[] body)
+    {
         var span = body.AsSpan();
         var type = (MsgType)span[0];
         var msgId = new Guid(span.Slice(1, 16));
@@ -50,7 +58,7 @@ public static class Codec
         while (read < n)
         {
             int r = await ns.ReadAsync(buf.AsMemory(read, n - read), ct);
-            if (r <= 0) return null;
+            if (r <= 0) return null; // 切断
             read += r;
         }
         return buf;

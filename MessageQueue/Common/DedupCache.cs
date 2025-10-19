@@ -11,8 +11,7 @@ public sealed class DedupCache
     public bool TryAdd(Guid id)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        bool added = _table.TryAdd(id, now);
-        return added;
+        return _table.TryAdd(id, now);
     }
 
     public bool Contains(Guid id) => _table.ContainsKey(id);
@@ -28,4 +27,5 @@ public sealed class DedupCache
         }
     }
 }
+
 
