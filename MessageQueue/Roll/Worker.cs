@@ -14,7 +14,9 @@ public sealed class Worker
 
     public Worker(string host, int port, string group)
     {
-        _host = host; _port = port; _group = string.IsNullOrWhiteSpace(group) ? "default" : group;
+        _host = host; 
+        _port = port;
+        _group = string.IsNullOrWhiteSpace(group) ? "default" : group;
     }
 
     public async Task RunAsync(CancellationToken ct)

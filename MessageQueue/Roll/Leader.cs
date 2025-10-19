@@ -176,7 +176,11 @@ public sealed class Leader
             lock (_lock)
             {
                 target = _workers.Values
-                    .Where(w => w.Group == group && w.Credit > 0)
+                    // 🧠 ここを修正 ↓
+                    .Where(w =>
+                        w.Credit > 0 &&
+                        SubjectMatcher.Match(w.SubjectPattern, $"job.assign.{group}")
+                    )
                     .OrderByDescending(w => w.Credit)
                     .ThenBy(w => w.Running)
                     .FirstOrDefault();
@@ -297,15 +301,16 @@ public sealed class Leader
     {
         public Guid WorkerId { get; }
         public string Group { get; }
+        public string SubjectPattern { get; }
         public NetworkStream Stream { get; }
         public int Credit;
         public int Running;
 
-        public WorkerConn(Guid workerId, NetworkStream stream, string group)
+        public WorkerConn(Guid workerId, NetworkStream stream, string subjectPattern)
         {
             WorkerId = workerId;
             Stream = stream;
-            Group = group;
+            Group = subjectPattern;
             Credit = 0;
             Running = 0;
         }
