@@ -990,3 +990,219 @@ var job = new JobRequest(
 
 必要なら、上の差分を**あなたのプロジェクトにマージ済みの“全文版”**として出せます（置き換えコピペ用に整理）。
 次は **チャンク転送** or **ACK集約** のどちらを先に入れる？
+
+
+
+これらのC#ファイル群は、**簡易的な分散ジョブキューシステム（MessageQueue）**を実装しています。
+クライアント（Client）、リーダー（Leader）、ワーカー（Worker）の3者がTCP通信を通じてジョブを送受信・実行します。
+全体的に **軽量なRPC風メッセージプロトコル** と **リトライ／再送／重複排除** が組み込まれています。
+
+以下で、各コンポーネントと処理の流れを日本語で詳しく解説します。
+
+---
+
+## 🧩 システム全体構成
+
+```
+Client → Leader → Worker
+   ↑         ↓
+   └── Result (戻り)
+```
+
+* **Client**: ジョブを送信する。
+* **Leader**: ジョブをキューイングし、空いているWorkerに割り当てる。結果をClientへ返す。
+* **Worker**: 指定されたジョブを実行し、結果をLeaderに返す。
+
+---
+
+## 📦 共通ライブラリ（MessageQueue.Common）
+
+### 1. Codec.cs
+
+**メッセージのシリアライズ／デシリアライズ処理**
+TCPストリームに送るときの形式：
+
+```
+[len:4byte LE][type:1][msgId:16][corrId:16]
+[subjectLen:2][subject:utf8][payloadLen:4][payload]
+```
+
+* `WriteAsync()`：Messageオブジェクトをこのバイナリ形式にエンコードして送信。
+* `ReadAsync()`：受信したバイト列からMessageを復元。
+* `ReadExactAsync()`：指定バイト数だけ正確に読み込む安全な読取関数。
+
+👉 このレイヤーでネットワークI/Oの細かい処理を吸収しています。
+
+---
+
+### 2. Message.cs
+
+メッセージの定義
+
+```csharp
+public enum MsgType { SubmitJob, AssignJob, AckJob, Credit, Result, HelloClient, HelloWorker }
+public sealed class Message { ... }
+```
+
+* **MsgType**：通信の種類（ジョブ提出、ジョブ割り当て、ACK、結果、中継など）。
+* **Message**：送受信の単位オブジェクト。Subjectはルーティング用の文字列。
+
+---
+
+### 3. Models.cs
+
+ジョブ内容と結果のデータ構造
+
+```csharp
+record JobRequest(Guid JobId, string ClientId, string ExecName, List<string> Args, List<InputFile> Files);
+record JobResult(Guid JobId, string ClientId, string ExecName, string Status, string Stdout, string Stderr, byte[]? OutputArchive);
+```
+
+---
+
+### 4. DedupCache.cs
+
+ワーカーが同じジョブを重複実行しないためのキャッシュ
+
+* `TryAdd()`：IDを追加（重複があればfalse）。
+* `Sweep()`：一定時間（TTL）経過した古いIDを削除。
+
+---
+
+### 5. SubjectMatcher.cs
+
+ワーカーの購読パターンマッチ（`*`, `>` ワイルドカード対応）
+例：
+
+* `job.assign.calcA.*` → calcAジョブのみ受け取る
+* `job.assign.*` → すべてのジョブを受け取る
+
+---
+
+## 🧠 Leader.cs（ジョブブローカー）
+
+リーダーはシステムの中枢。以下の責務があります：
+
+1. **Client／Worker接続受付**
+
+   * `HelloClient` または `HelloWorker` メッセージで識別。
+2. **ジョブキュー管理**
+
+   * `SubmitJob` 受信 → ExecNameごとにキューへ格納。
+3. **スケジューリング**
+
+   * `_execRound` でラウンドロビン割り当て。
+   * Workerの `Credit` と `Running` 状態を考慮。
+4. **再送制御**
+
+   * `AckJob` が来ないとき、指数バックオフ＋ジッターで再送。
+   * 最大 `MaxAttempts=6` 回試行、失敗時は DLQ（Dead Letter Queue）へ。
+5. **結果転送**
+
+   * Workerの `AckJob` に含まれる結果を Client へ中継。
+
+### 内部データ構造
+
+* `_clients`：ClientId→接続ストリーム
+* `_workers`：WorkerId→接続ストリーム
+* `_execQueues`：ExecName→ジョブキュー
+* `_inflight`：未ACKジョブのトラッキング（再送用）
+* `_pumpTimer`：200msごとに定期チェック（タイムアウト＋スケジューリング）
+
+---
+
+## ⚙️ Worker.cs（ジョブ実行ノード）
+
+Workerは実際にジョブを実行します。
+
+### 処理の流れ
+
+1. **Leaderに接続 & Hello送信**
+
+   ```csharp
+   MsgType.HelloWorker, Subject = "job.assign.calcA.*"
+   ```
+
+2. **初期クレジット送信**
+   → Leaderに「1つジョブを受けられる」と通知。
+
+3. **ジョブ受信 (`AssignJob`)**
+
+   * 受信データを `JobRequest` にデシリアライズ。
+   * DedupCache で重複チェック。
+   * 実行メソッド `ExecuteJobAsync()` を呼ぶ。
+
+4. **ジョブ実行**
+
+   * `/opt/grid/exe` から実行ファイルをコピー。
+   * 入力ファイルを展開。
+   * `ProcessStartInfo` で外部プロセス起動。
+   * stdout / stderr を収集。
+   * `/tmp/jobs/{JobId}` をZIP化して結果生成。
+
+5. **結果送信 (`AckJob`)**
+
+   * `JobResult` をシリアライズして Leader に送信。
+   * DedupCache に登録。
+   * `Credit` を1増やして再びジョブ受信可能に。
+
+---
+
+## 💻 Client.cs（ジョブ送信側）
+
+1. Leaderに接続し、`HelloClient` を送信。
+2. サンプルとして3つのジョブ（calcA）を送信。
+3. Leader経由で返ってくる `Result` を待機。
+4. 結果をコンソール出力。
+
+---
+
+## 🚀 Program.cs（エントリーポイント）
+
+CLI実行の分岐：
+
+```bash
+dotnet run -- leader 5000
+dotnet run -- worker 127.0.0.1 5000 job.assign.*
+dotnet run -- client 127.0.0.1 5000 clientA
+```
+
+* `leader`: ブローカー起動
+* `worker`: ワーカー起動
+* `client`: クライアント起動
+
+---
+
+## 🔁 全体の通信シーケンス
+
+```
+Client                Leader                Worker
+  |---HelloClient----->|
+  |----SubmitJob------>|
+  |                    |---HelloWorker----->|
+  |                    |---AssignJob------->|
+  |                    |<---AckJob----------|
+  |<---Result----------|
+```
+
+---
+
+## 📋 まとめ
+
+| 役割                 | 機能                       |
+| ------------------ | ------------------------ |
+| **Client**         | ジョブを送信し、結果を受信            |
+| **Leader**         | ジョブをキューに積み、ワーカーに配分、結果を中継 |
+| **Worker**         | ジョブを実行して結果を返す（重複防止付き）    |
+| **Codec**          | メッセージのバイナリ変換             |
+| **DedupCache**     | ジョブの重複検出                 |
+| **SubjectMatcher** | ワイルドカード購読処理              |
+| **Leader内部**       | 再送制御・ラウンドロビン割り当て・DLQ処理   |
+
+---
+
+希望があれば、
+💡「ジョブ再送のアルゴリズム（指数バックオフとジッター）」や
+💡「Workerの実行環境とファイル構成」
+などを図解付きでさらに詳しく説明することもできます。
+どの部分を深掘りしたいですか？
