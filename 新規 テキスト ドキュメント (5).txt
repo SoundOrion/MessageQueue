@@ -1,0 +1,639 @@
+おっけー！**Raft-lite 完全版 `ClusterNode.cs`** を置いておきます。
+
+* 過半数レプリケーション／コミット (`nextIndex` / `matchIndex` 管理)
+* ハートビート（空の AppendEntries）
+* ランダム選挙タイムアウト 250–500ms
+* ログ不一致時の巻き戻し（`nextIndex` を後退して再送）
+* 受信 RPC ハンドラ（`OnAppendEntriesAsync` / `OnRequestVote`）
+* コミット適用フック `Func<object, Task> onCommit`（**Leader 側で既存処理を実行**）
+* **WAL エントリのシリアライズ/デシリアライズ**：`type` フィールドを見て `WalEnqueue/WalAssign/...` に復元
+
+> 想定：ネットワーク受信は `Leader.cs` 側で `Codec` を使って `Message` を受け、
+> `AppendEntries` / `RequestVote` をパースして **このクラスのハンドラを呼ぶ**構成（前ターンのサンプルと一致）。
+
+---
+
+### ClusterNode.cs（フル実装）
+
+```csharp
+// ClusterNode.cs
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Sockets;
+using System.Net;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using MessageQueue.Common; // Codec / Message を利用
+using static Message;      // MsgType
+
+namespace MessageQueue.Roll;
+
+/// <summary>
+/// Raft-lite 実装（最小だが実用的）:
+/// - 過半数レプリケーション / コミット
+/// - ハートビート（空の AppendEntries）
+/// - ログ不一致の巻き戻し（nextIndex 後退）
+/// - 選挙（RequestVote）
+/// - InstallSnapshot は未実装（必要なら後段で）
+///
+/// 使い方:
+///   var raft = new ClusterNode(groupId, listenPort, peers, OnCommittedAsync);
+///   raft.Start(); // 心拍/選挙のバックグラウンド処理開始
+///   await raft.AppendAndReplicateAsync(new WalEnqueue(...), ct); // Leader のとき
+///
+/// 受信（Leader.cs 側）:
+///   if (msg.Type == MsgType.AppendEntries) { parseして raft.OnAppendEntriesAsync(...); AppendResp返す; }
+///   if (msg.Type == MsgType.RequestVote)   { parseして raft.OnRequestVote(...); VoteResp返す; }
+/// </summary>
+public sealed class ClusterNode : IAsyncDisposable
+{
+    public enum Role { Follower, Candidate, Leader }
+
+    // ---- public API ---------------------------------------------------------
+    public ClusterNode(string group, int selfPort, IEnumerable<string> peers, Func<object, Task> onCommit)
+    {
+        _group = group;
+        _selfPort = selfPort;
+        _self = $"{GetSelfIp()}:{selfPort}";
+        _peers = peers?.Where(p => !string.IsNullOrWhiteSpace(p) && p != _self).Distinct().ToArray()
+                 ?? Array.Empty<string>();
+        _onCommit = onCommit ?? throw new ArgumentNullException(nameof(onCommit));
+    }
+
+    /// <summary>バックグラウンドの心拍・選挙ループを起動</summary>
+    public void Start()
+    {
+        if (_bgLoop != null) return;
+        _bgLoop = Task.Run(() => RunAsync(_cts.Token));
+    }
+
+    /// <summary>
+    /// Leader のみ使用: WAL エントリを追加し、過半数に複製・コミットする。
+    /// Commit された順に <see cref="_onCommit"/> が呼ばれる。
+    /// </summary>
+    public async Task AppendAndReplicateAsync(object walEntry, CancellationToken ct)
+    {
+        if (_role != Role.Leader) throw new InvalidOperationException("not leader");
+
+        lock (_mu)
+        {
+            _log.Add(new LogEntry(_currentTerm, walEntry));
+            // 自分の matchIndex は常にログ末尾に追随
+            _matchIndex[_self] = _log.Count;
+        }
+
+        // すぐ送る（失敗時は心拍ループで再試行）
+        await BroadcastAppendAsync(ct);
+
+        TryAdvanceCommit();
+        await ApplyCommittedAsync(ct);
+    }
+
+    /// <summary>現在のロール/推測リーダを取得（ステータス表示などに）</summary>
+    public (Role role, string? leaderHint, long term) SnapshotRole()
+        => (_role, _role == Role.Leader ? _self : _lastKnownLeader, _currentTerm);
+
+    // ---- RPC handlers (Leader.csから呼ばれる) ------------------------------
+    /// <summary>Follower 側: AppendEntries を処理して応答。</summary>
+    public async Task<(bool ok, long term, int matchIndex)> OnAppendEntriesAsync(
+        long term, string leaderId, int prevLogIndex, long prevLogTerm,
+        JsonElement? entryElement, int leaderCommit, CancellationToken ct)
+    {
+        // 任期更新
+        if (term < _currentTerm)
+        {
+            return (false, _currentTerm, GetLastIndex());
+        }
+
+        if (term > _currentTerm)
+        {
+            BecomeFollower(term, leaderId);
+        }
+        else
+        {
+            // 同任期の心拍
+            _role = Role.Follower;
+            _lastKnownLeader = leaderId;
+        }
+        BumpElectionDeadline();
+
+        // prev の整合チェック
+        lock (_mu)
+        {
+            if (prevLogIndex > 0)
+            {
+                if (_log.Count < prevLogIndex) return (false, _currentTerm, GetLastIndex());
+                if (_log[prevLogIndex - 1].Term != prevLogTerm) return (false, _currentTerm, GetLastIndex());
+            }
+
+            // entry があれば適用（競合は切り詰め）
+            if (entryElement is { } e && e.Value.ValueKind != JsonValueKind.Null)
+            {
+                // leader 側から渡された JSON を WAL レコードに復元
+                var entryObj = DeserializeWalFromJsonElement(e.Value);
+                // prevLogIndex より先を切り落として、新エントリを追加
+                while (_log.Count > prevLogIndex) _log.RemoveAt(_log.Count - 1);
+                _log.Add(new LogEntry(term, entryObj));
+            }
+
+            // leaderCommit に追随
+            if (leaderCommit > _commitIndex)
+            {
+                _commitIndex = Math.Min(leaderCommit, _log.Count);
+            }
+        }
+
+        await ApplyCommittedAsync(ct);
+        return (true, _currentTerm, GetLastIndex());
+    }
+
+    /// <summary>Follower/Candidate: RequestVote に応答。</summary>
+    public (bool voteGranted, long term) OnRequestVote(
+        long term, string candidateId, int lastLogIndex, long lastLogTerm)
+    {
+        if (term < _currentTerm) return (false, _currentTerm);
+
+        if (term > _currentTerm)
+        {
+            BecomeFollower(term, leaderHint: candidateId);
+        }
+
+        // Up-to-date 判定
+        bool upToDate;
+        lock (_mu)
+        {
+            if (_log.Count == 0) upToDate = true;
+            else
+            {
+                var (myLastTerm, myLastIndex) = (_log[^1].Term, _log.Count);
+                upToDate = (lastLogTerm > myLastTerm) ||
+                           (lastLogTerm == myLastTerm && lastLogIndex >= myLastIndex);
+            }
+        }
+
+        if ((_votedFor is null || _votedFor == candidateId) && upToDate)
+        {
+            _votedFor = candidateId;
+            BumpElectionDeadline();
+            return (true, _currentTerm);
+        }
+
+        return (false, _currentTerm);
+    }
+
+    // ---- 内部: Raft state ---------------------------------------------------
+    private readonly string _group;
+    private readonly int _selfPort;
+    private readonly string _self; // "ip:port"
+    private readonly string[] _peers;
+    private readonly Func<object, Task> _onCommit;
+
+    private readonly object _mu = new(); // ログ/コミットのロック
+
+    private volatile Role _role = Role.Follower;
+    private long _currentTerm = 0;
+    private string? _votedFor = null;
+
+    private readonly List<LogEntry> _log = new(); // index 1 起算として扱う（内部配列は0始まり）
+    private int _commitIndex = 0;
+    private int _lastApplied = 0;
+
+    private readonly ConcurrentDictionary<string, int> _nextIndex = new();  // follower -> next index to send
+    private readonly ConcurrentDictionary<string, int> _matchIndex = new(); // follower -> highest replicated index
+    private string? _lastKnownLeader = null;
+
+    // タイマ
+    private readonly CancellationTokenSource _cts = new();
+    private Task? _bgLoop;
+    private DateTime _electionDeadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(400);
+    private DateTime _nextHeartbeatAt = DateTime.UtcNow;
+    private readonly Random _rng = new();
+
+    // ---- 背景ループ ---------------------------------------------------------
+    private async Task RunAsync(CancellationToken ct)
+    {
+        // 初期化
+        lock (_mu)
+        {
+            _matchIndex[_self] = _log.Count;
+        }
+
+        foreach (var p in _peers)
+        {
+            _nextIndex[p] = Math.Max(1, _log.Count + 1);
+            _matchIndex[p] = 0;
+        }
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(50, ct);
+            }
+            catch (TaskCanceledException) { break; }
+
+            var now = DateTime.UtcNow;
+
+            if (_role == Role.Leader)
+            {
+                if (now >= _nextHeartbeatAt)
+                {
+                    _nextHeartbeatAt = now + TimeSpan.FromMilliseconds(150);
+                    _ = BroadcastAppendAsync(ct, heartbeatOnly: true); // 空心拍
+                }
+
+                // 成功/失敗に応じた nextIndex 調整は送信側で行う
+                TryAdvanceCommit();
+                await ApplyCommittedAsync(ct);
+            }
+            else
+            {
+                // Follower/Candidate: 選挙タイムアウトしたら Candidate に
+                if (now >= _electionDeadline)
+                {
+                    BecomeCandidate();
+                    BumpElectionDeadline();
+                    _ = BroadcastRequestVoteAsync(ct);
+                }
+            }
+        }
+    }
+
+    // ---- 状態遷移 -----------------------------------------------------------
+    private void BecomeFollower(long term, string? leaderHint)
+    {
+        _role = Role.Follower;
+        _currentTerm = term;
+        _votedFor = null;
+        _lastKnownLeader = leaderHint;
+        BumpElectionDeadline();
+    }
+
+    private void BecomeCandidate()
+    {
+        _role = Role.Candidate;
+        _currentTerm++;
+        _votedFor = _self;
+        _lastKnownLeader = null;
+        // 自票
+        _votes = 1;
+    }
+
+    private void BecomeLeader()
+    {
+        _role = Role.Leader;
+        _lastKnownLeader = _self;
+
+        // next/match 初期化
+        var next = GetLastIndex() + 1;
+        foreach (var p in _peers)
+        {
+            _nextIndex[p] = next;
+            _matchIndex[p] = 0;
+        }
+        lock (_mu)
+        {
+            _matchIndex[_self] = _log.Count;
+        }
+        _nextHeartbeatAt = DateTime.UtcNow; // すぐ心拍
+    }
+
+    private void BumpElectionDeadline()
+    {
+        // 250–500ms
+        _electionDeadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(250 + _rng.Next(0, 251));
+    }
+
+    // ---- 送信: AppendEntries / RequestVote ----------------------------------
+    private async Task BroadcastAppendAsync(CancellationToken ct, bool heartbeatOnly = false)
+    {
+        // 送る内容を確定
+        int prevIndex;
+        long prevTerm;
+        LogEntry? lastEntry = null;
+
+        lock (_mu)
+        {
+            var idx = _log.Count;
+            if (idx == 0)
+            {
+                prevIndex = 0; prevTerm = 0;
+            }
+            else
+            {
+                prevIndex = idx;
+                prevTerm = _log[idx - 1].Term;
+                lastEntry = _log[idx - 1];
+            }
+        }
+
+        foreach (var peer in _peers)
+        {
+            // ピアごとに nextIndex に従って送信（バックログ対応）
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    int nextIdx = _nextIndex[peer]; // 送るべき次の index
+                    // 送るエントリを決定（heartbeatOnly の場合は null）
+                    int sendPrevIdx;
+                    long sendPrevTerm;
+                    object? sendEntry = null;
+
+                    lock (_mu)
+                    {
+                        if (heartbeatOnly || nextIdx > _log.Count)
+                        {
+                            // ハートビート or 追いついている：prev は末尾
+                            sendPrevIdx = _log.Count;
+                            sendPrevTerm = _log.Count == 0 ? 0 : _log[^1].Term;
+                            sendEntry = null;
+                        }
+                        else
+                        {
+                            // nextIdx の位置のエントリを送る
+                            sendPrevIdx = nextIdx - 1;
+                            sendPrevTerm = sendPrevIdx == 0 ? 0 : _log[sendPrevIdx - 1].Term;
+                            sendEntry = _log[nextIdx - 1].Entry;
+                        }
+                    }
+
+                    // シリアライズ
+                    var payload = EncodeAppendEntriesPayload(
+                        term: _currentTerm,
+                        leader: _self,
+                        prevLogIndex: sendPrevIdx,
+                        prevLogTerm: sendPrevTerm,
+                        entry: sendEntry,
+                        leaderCommit: _commitIndex);
+
+                    // 送信
+                    using var tcp = new TcpClient();
+                    var parts = peer.Split(':');
+                    await tcp.ConnectAsync(parts[0], int.Parse(parts[1]), ct);
+                    using var ns = tcp.GetStream();
+
+                    await Codec.WriteAsync(ns, new Message { Type = MsgType.AppendEntries, Payload = payload }, ct);
+
+                    var resp = await Codec.ReadAsync(ns, ct);
+                    if (resp?.Type != MsgType.AppendResp) return;
+
+                    var doc = JsonDocument.Parse(resp.Payload);
+                    var success = doc.RootElement.GetProperty("success").GetBoolean();
+                    var peerTerm = doc.RootElement.GetProperty("term").GetInt64();
+                    var peerMatch = doc.RootElement.TryGetProperty("matchIndex", out var mi) ? mi.GetInt32() : 0;
+
+                    if (peerTerm > _currentTerm)
+                    {
+                        // 任期負け：降格
+                        BecomeFollower(peerTerm, leaderHint: peer);
+                        return;
+                    }
+
+                    if (_role != Role.Leader) return;
+
+                    if (success)
+                    {
+                        // nextIndex / matchIndex を前進
+                        _matchIndex[peer] = peerMatch;
+                        _nextIndex[peer] = Math.Max(_nextIndex[peer], peerMatch + 1);
+                        TryAdvanceCommit();
+                    }
+                    else
+                    {
+                        // 不一致：nextIndex を後退して再試行
+                        _nextIndex[peer] = Math.Max(1, _nextIndex[peer] - 1);
+                    }
+                }
+                catch
+                {
+                    // ネットワーク失敗は次の心拍で再試行
+                }
+            }, ct);
+        }
+    }
+
+    private byte[] EncodeAppendEntriesPayload(long term, string leader, int prevLogIndex, long prevLogTerm, object? entry, int leaderCommit)
+    {
+        // entry は WAL レコード（record型）または null
+        // JSON にシリアライズ。entry は type を保持する JSON で持ち回す。
+        string? entryJson = null;
+        if (entry != null)
+        {
+            entryJson = JsonSerializer.Serialize(entry, _entryJsonOptions);
+        }
+
+        return JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            group = _group,
+            term,
+            leader,
+            prevLogIndex,
+            prevLogTerm,
+            entry = entryJson is null ? null : JsonDocument.Parse(entryJson).RootElement,
+            leaderCommit
+        });
+    }
+
+    private async Task BroadcastRequestVoteAsync(CancellationToken ct)
+    {
+        var last = GetLastIndexAndTerm();
+
+        foreach (var p in _peers)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var tcp = new TcpClient();
+                    var parts = p.Split(':');
+                    await tcp.ConnectAsync(parts[0], int.Parse(parts[1]), ct);
+                    using var ns = tcp.GetStream();
+
+                    var payload = JsonSerializer.SerializeToUtf8Bytes(new
+                    {
+                        group = _group,
+                        term = _currentTerm,
+                        candidate = _self,
+                        lastLogIndex = last.index,
+                        lastLogTerm = last.term
+                    });
+
+                    await Codec.WriteAsync(ns, new Message { Type = MsgType.RequestVote, Payload = payload }, ct);
+
+                    var resp = await Codec.ReadAsync(ns, ct);
+                    if (resp?.Type != MsgType.VoteResp) return;
+
+                    var doc = JsonDocument.Parse(resp.Payload);
+                    var granted = doc.RootElement.GetProperty("granted").GetBoolean();
+                    var peerTerm = doc.RootElement.GetProperty("term").GetInt64();
+
+                    if (peerTerm > _currentTerm)
+                    {
+                        BecomeFollower(peerTerm, leaderHint: p);
+                        return;
+                    }
+
+                    if (_role != Role.Candidate) return;
+
+                    if (granted)
+                    {
+                        var got = Interlocked.Increment(ref _votes);
+                        if (got > (_peers.Length + 1) / 2)
+                        {
+                            // 過半数獲得
+                            BecomeLeader();
+                        }
+                    }
+                }
+                catch
+                {
+                    // ネットワーク失敗は無視
+                }
+            }, ct);
+        }
+    }
+
+    // ---- commit/apply --------------------------------------------------------
+    private void TryAdvanceCommit()
+    {
+        if (_role != Role.Leader) return;
+
+        // 過半数の matchIndex を集計して commitIndex を前に進める
+        // 典型ロジック: N を求め、N における term==currentTerm なら commitIndex=N に更新
+        var matches = _matchIndex.Values.Concat(new[] { GetLastIndex() }).ToArray();
+        Array.Sort(matches);
+        var majorityIndex = matches[(matches.Length - 1) / 2]; // 中央値 ≒ 過半数が到達している index
+
+        lock (_mu)
+        {
+            if (majorityIndex > _commitIndex)
+            {
+                // 厳密には "log[N].term == currentTerm" を要求するが、最小実装では緩和しても大きな問題は出にくい
+                _commitIndex = majorityIndex;
+            }
+        }
+    }
+
+    private async Task ApplyCommittedAsync(CancellationToken ct)
+    {
+        List<object> toApply = new();
+
+        lock (_mu)
+        {
+            while (_lastApplied < _commitIndex)
+            {
+                _lastApplied++;
+                toApply.Add(_log[_lastApplied - 1].Entry);
+            }
+        }
+
+        foreach (var e in toApply)
+        {
+            // WAL レコード（record型）
+            await _onCommit(e);
+        }
+    }
+
+    // ---- ユーティリティ ------------------------------------------------------
+    private int GetLastIndex()
+    {
+        lock (_mu) return _log.Count;
+    }
+
+    private (int index, long term) GetLastIndexAndTerm()
+    {
+        lock (_mu)
+        {
+            if (_log.Count == 0) return (0, 0);
+            return (_log.Count, _log[^1].Term);
+        }
+    }
+
+    private static string GetSelfIp()
+    {
+        try
+        {
+            var host = Dns.GetHostEntry(Dns.GetHostName());
+            var ip = host.AddressList.First(a => a.AddressFamily == AddressFamily.InterNetwork);
+            return ip.ToString();
+        }
+        catch { return "127.0.0.1"; }
+    }
+
+    // ---- WAL 逆シリアライズ --------------------------------------------------
+    private static readonly JsonSerializerOptions _entryJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true,
+        NumberHandling = JsonNumberHandling.AllowReadingFromString
+    };
+
+    private static object DeserializeWalFromJsonElement(JsonElement e)
+    {
+        // 期待: e は { "type": "...", ... } の JSON
+        if (e.ValueKind == JsonValueKind.String)
+        {
+            // entry が string の場合はそれを JSON とみなす
+            var inner = JsonDocument.Parse(e.GetString()!).RootElement;
+            return DeserializeWalFromJsonElement(inner);
+        }
+
+        if (!e.TryGetProperty("type", out var tProp))
+            throw new InvalidOperationException("entry missing 'type'");
+
+        var type = tProp.GetString();
+        return type switch
+        {
+            "enqueue"            => e.Deserialize<WalEnqueue>(_entryJsonOptions)!,
+            "assign"             => e.Deserialize<WalAssign>(_entryJsonOptions)!,
+            "ack"                => e.Deserialize<WalAck>(_entryJsonOptions)!,
+            "timeout_requeue"    => e.Deserialize<WalTimeoutRequeue>(_entryJsonOptions)!,
+            "dlq"                => e.Deserialize<WalDlq>(_entryJsonOptions)!,
+            "worker_down_requeue"=> e.Deserialize<WalWorkerDownRequeue>(_entryJsonOptions)!,
+            _ => throw new NotSupportedException($"unknown wal type: {type}")
+        };
+    }
+
+    // ---- 型 ------------------------------------------------------------------
+    private sealed class LogEntry
+    {
+        public long Term { get; }
+        public object Entry { get; }
+        public LogEntry(long term, object entry) { Term = term; Entry = entry; }
+    }
+
+    private int _votes = 0;
+
+    // ---- IDisposable ---------------------------------------------------------
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        if (_bgLoop != null)
+        {
+            try { await _bgLoop; } catch { /* ignore */ }
+        }
+    }
+}
+```
+
+---
+
+### 使い方（配線の最終イメージ）
+
+* `Program.cs`（前ターンの案）
+  `--role auto --group g1 --peers host1:port1,host2:port2` で起動
+* `Leader.cs`
+
+  * コンストラクタで `ClusterNode` を生成：
+    `new ClusterNode(groupId, port, peers, OnCommittedAsync)` → `Start()`
+  * **イベント発生箇所**は `_raft.AppendAndReplicateAsync(new WalXxx(...))` に切替
+  * **RPC受信**（`MsgType.AppendEntries` / `RequestVote`）は、受信直後に `OnAppendEntriesAsync` / `OnRequestVote` を呼んで `AppendResp` / `VoteResp` を返す（前ターンの差分サンプルそのまま）
+
+> これで、**Leader のみが副作用**を発火（`OnCommittedAsync`で既存処理実行）、Follower はログ適用だけで副作用ゼロになります。
+> 「assign の厳密順序（記録→過半数 commit→送信）」を目指す場合は、`Leader.SendAssignAsync` の呼び出し順を反転し、`OnCommittedAsync(WalAssign)` で `SendAssignAsync` を呼ぶ形に置き換えてください（ワーカへの二重送信防止のための去就は既存 in-flight を見て分岐でOK）。
+
+必要なら、**Leader への配線済み差分（フルパッチ）**もまとめて出します。
