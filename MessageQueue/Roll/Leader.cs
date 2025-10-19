@@ -16,6 +16,16 @@ public sealed class Leader
 
     private readonly System.Timers.Timer _retransmitTimer;
 
+    // ACK タイムアウト → 再送に「指数バックオフ + 最大試行回数」
+    private static readonly TimeSpan InitialAckTimeout = TimeSpan.FromSeconds(1);  // 初回待ち
+    private static readonly TimeSpan MaxAckTimeout = TimeSpan.FromSeconds(30); // 上限
+    private const double BackoffFactor = 2.0;                      // 指数倍
+    private const double JitterRate = 0.20;                     // ±20%のジッタ
+    private const int MaxAttempts = 6;                        // 送信総回数(初回含む)
+
+    private static readonly ThreadLocal<Random> _rng = new(() => new Random());
+
+
     public Leader(int port)
     {
         _listener = new TcpListener(IPAddress.Any, port);
@@ -161,7 +171,7 @@ public sealed class Leader
             var msg = new Message
             {
                 Type = MsgType.AssignJob,
-                MsgId = job.JobId,        // = JobId
+                MsgId = job.JobId,
                 CorrId = Guid.Empty,
                 Payload = job.Payload
             };
@@ -170,8 +180,11 @@ public sealed class Leader
             wc.Credit--;
             wc.Running++;
 
-            _inflight[job.JobId] = new Inflight(job, wc, SentAt: DateTime.UtcNow, Attempt: attempt);
-            Console.WriteLine($"[Leader] Assigned {job.JobId} to {wc.WorkerId} (try={attempt})");
+            var timeout = (attempt == 1) ? InitialAckTimeout : NextTimeoutFor(attempt - 1, InitialAckTimeout); // 再送時は前回から計算でもOK
+            var due = DateTime.UtcNow + timeout;
+
+            _inflight[job.JobId] = new Inflight(job, wc, due, timeout, attempt);
+            Console.WriteLine($"[Leader] Assigned {job.JobId} to {wc.WorkerId} (try={attempt}, timeout={timeout.TotalMilliseconds:N0}ms)");
         }
         catch (Exception ex)
         {
@@ -180,33 +193,78 @@ public sealed class Leader
         }
     }
 
+
     private void CheckTimeouts()
     {
         var now = DateTime.UtcNow;
+
         foreach (var kv in _inflight.ToArray())
         {
             var inf = kv.Value;
-            if (now - inf.SentAt < TimeSpan.FromSeconds(5)) continue; // ACK待ち
+            if (now < inf.DueAt) continue; // まだ待つ
 
-            if (_inflight.TryRemove(inf.Job.JobId, out _))
+            // 期限到達 → 取り除く
+            if (!_inflight.TryRemove(inf.Job.JobId, out _)) continue;
+
+            // 最大試行に達したら DLQ または再キュー
+            if (inf.Attempt >= MaxAttempts)
             {
-                // 別Workerを優先
-                WorkerConn? target;
-                lock (_lock)
-                {
-                    target = _workers.Values
-                        .Where(w => w.Credit > 0 && !ReferenceEquals(w, inf.Owner))
-                        .OrderByDescending(w => w.Credit).ThenBy(w => w.Running)
-                        .FirstOrDefault() ?? inf.Owner;
-                }
-                Console.WriteLine($"[Leader] Retransmit {inf.Job.JobId} (next try={inf.Attempt + 1})");
-                SendAssign(target!, inf.Job, inf.Attempt + 1);
+                Console.WriteLine($"[Leader] Job {inf.Job.JobId} exceeded max attempts ({MaxAttempts}). Requeue/DLQ.");
+                _queue.Enqueue(inf.Job);            // ここを DLQ に変えることも可能
+                continue;
             }
+
+            // 次の送信先（別Workerを優先）
+            WorkerConn? target;
+            lock (_lock)
+            {
+                target = _workers.Values
+                    .Where(w => w.Credit > 0 && !ReferenceEquals(w, inf.Owner))
+                    .OrderByDescending(w => w.Credit).ThenBy(w => w.Running)
+                    .FirstOrDefault() ?? inf.Owner;
+            }
+
+            // 次のタイムアウト値（指数バックオフ + ジッタ）
+            var nextTimeout = NextTimeout(inf.Timeout);
+            var nextAttempt = inf.Attempt + 1;
+
+            Console.WriteLine($"[Leader] Retransmit {inf.Job.JobId} -> {target!.WorkerId} (try={nextAttempt}, timeout={nextTimeout.TotalMilliseconds:N0}ms)");
+            // 再送
+            SendAssign(target, inf.Job, nextAttempt);
+            // SendAssign 内で新しい timeout/due を設定します
         }
     }
 
+    // 直前のTimeoutから次を計算（指数&ジッタ&上限）
+    private TimeSpan NextTimeout(TimeSpan prev)
+    {
+        var baseMs = Math.Min(prev.TotalMilliseconds * BackoffFactor, MaxAckTimeout.TotalMilliseconds);
+        var jitter = 1.0 + ((_rng.Value!.NextDouble() * 2.0 - 1.0) * JitterRate); // [0.8, 1.2]
+        return TimeSpan.FromMilliseconds(Math.Max(1, baseMs * jitter));
+    }
+
+    // 初回から N 回目までを計算したい場合に使うヘルパ
+    private TimeSpan NextTimeoutFor(int attemptsAlready, TimeSpan initial)
+    {
+        var t = initial;
+        for (int i = 0; i < attemptsAlready; i++) t = NextTimeout(t);
+        return t;
+    }
+
+
     private sealed record JobEnvelope(Guid JobId, byte[] Payload);
-    private sealed record Inflight(JobEnvelope Job, WorkerConn Owner, DateTime SentAt, int Attempt);
+
+    // 旧:
+    // private sealed record Inflight(JobEnvelope Job, WorkerConn Owner, DateTime SentAt, int Attempt);
+
+    // 新:
+    private sealed record Inflight(
+        JobEnvelope Job,
+        WorkerConn Owner,
+        DateTime DueAt,     // 次にタイムアウト判定する期限
+        TimeSpan Timeout,   // 現在の待ち時間
+        int Attempt    // 送信試行回数（1=初回）
+    );
 
     private sealed class WorkerConn
     {
