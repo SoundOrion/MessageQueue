@@ -6,8 +6,9 @@ namespace MessageQueue.Roll;
 
 public sealed class Client
 {
-    private readonly string _host; private readonly int _port;
-    public Client(string host, int port) { _host = host; _port = port; }
+    private readonly string _host; private readonly int _port; private readonly string _group;
+    public Client(string host, int port, string group)
+    { _host = host; _port = port; _group = string.IsNullOrWhiteSpace(group) ? "default" : group; }
 
     public async Task RunAsync(CancellationToken ct)
     {
@@ -17,13 +18,20 @@ public sealed class Client
 
         await Codec.WriteAsync(ns, new Message { Type = MsgType.HelloClient }, ct);
 
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < 8; i++)
         {
             var jobId = Guid.NewGuid();
-            var payload = Encoding.UTF8.GetBytes($"job-{i}");
-            await Codec.WriteAsync(ns, new Message { Type = MsgType.SubmitJob, MsgId = jobId, Payload = payload }, ct);
-            Console.WriteLine($"[Client] Submitted {jobId} ({payload.Length}B)");
+            var payload = Encoding.UTF8.GetBytes($"job-{_group}-{i}");
+            await Codec.WriteAsync(ns, new Message
+            {
+                Type = MsgType.SubmitJob,
+                MsgId = jobId,
+                Subject = _group,
+                Payload = payload
+            }, ct);
+            Console.WriteLine($"[Client({_group})] Submitted {jobId} ({payload.Length}B)");
         }
     }
 }
+
 

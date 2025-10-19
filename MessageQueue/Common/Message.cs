@@ -10,15 +10,15 @@ public enum MsgType : byte
     AckJob = 3,   // Worker -> Leader
     Credit = 4,   // Worker -> Leader (受け入れ枠増)
     HelloClient = 9,   // Client -> Leader (役割宣言)
-    HelloWorker = 10,  // Worker -> Leader (役割宣言: MsgId=workerId)
+    HelloWorker = 10,  // Worker -> Leader (役割宣言: MsgId=workerId, Subject=group)
 }
 
 public sealed class Message
 {
     public MsgType Type { get; init; }
-    public Guid MsgId { get; init; }    // JobId / WorkerId / arbitrary
-    public Guid CorrId { get; init; }   // 相関（Ack など）
+    public Guid MsgId { get; init; }                  // JobId / WorkerId / arbitrary
+    public Guid CorrId { get; init; }                 // 相関（Ack など）
+    public string Subject { get; init; } = string.Empty; // ルーティング（"group" を置く）
     public byte[] Payload { get; init; } = Array.Empty<byte>();
 }
-
 
