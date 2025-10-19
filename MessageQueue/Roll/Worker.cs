@@ -203,8 +203,13 @@ public sealed class Worker
         // 入力展開（簡易パス検証）
         foreach (var f in req.Files)
         {
-            if (string.IsNullOrEmpty(f.Name) || f.Name.Contains("..") || f.Name.Contains('\\') || f.Name.Contains('/'))
+            if (string.IsNullOrWhiteSpace(f.Name) ||
+                f.Name.Contains("..") ||
+                f.Name.Contains('\\') ||
+                f.Name.Contains('/'))
+            {
                 return ("FAILED", "", "invalid file name", null);
+            }
 
             var path = Path.Combine(jobDir, f.Name);
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);

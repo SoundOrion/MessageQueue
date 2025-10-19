@@ -223,7 +223,10 @@ public sealed class Leader
             switch (m.Type)
             {
                 case MsgType.Credit:
-                    wc.Credit++;
+                    int n = 1;
+                    if (m.Payload is { Length: 4 })
+                        n = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(m.Payload);
+                    wc.Credit += Math.Max(1, n);
                     PumpAllExec();
                     break;
 
