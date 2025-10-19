@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Timers;
 
@@ -52,8 +53,6 @@ public sealed class Leader
     public Leader(int port)
     {
         _listener = new TcpListener(IPAddress.Any, port);
-
-        // 送信タイムアウトなどは、必要なら TcpClient 側で設定する（ここでは既存設計に合わせる）
 
         // 定期チェック（タイムアウト監視 + スケジューリング）
         _pumpTimer = new System.Timers.Timer(200);
@@ -115,6 +114,7 @@ public sealed class Leader
             }
             finally
             {
+                cc.Stop(); // 送信ループ停止
                 _clients.TryRemove(clientId, out _);
                 Console.WriteLine($"[Leader] Client disconnected: {clientId}");
             }
@@ -135,6 +135,7 @@ public sealed class Leader
             finally
             {
                 lock (_lock) _workers.Remove(workerId);
+                wc.Stop(); // 送信ループ停止
                 Console.WriteLine($"[Leader] Worker disconnected: {workerId}");
 
                 // in-flight の回収（担当者が落ちた分を再投入）
@@ -215,22 +216,17 @@ public sealed class Leader
                         {
                             try
                             {
-                                await client.SendLock.WaitAsync(ct);
-                                try
+                                var resMsg = new Message
                                 {
-                                    await Codec.WriteAsync(client.Stream, new Message
-                                    {
-                                        Type = MsgType.Result,
-                                        MsgId = inf.Job.JobId,
-                                        CorrId = inf.Job.JobId,
-                                        Subject = $"job.result.{inf.Job.ClientId}.{inf.Job.JobId:N}",
-                                        Payload = m.Payload
-                                    }, ct);
-                                }
-                                finally
-                                {
-                                    client.SendLock.Release();
-                                }
+                                    Type = MsgType.Result,
+                                    MsgId = inf.Job.JobId,
+                                    CorrId = inf.Job.JobId,
+                                    Subject = $"job.result.{inf.Job.ClientId}.{inf.Job.JobId:N}",
+                                    Payload = m.Payload
+                                };
+
+                                // 中継は送信キューへ投入（接続単位で直列送信）
+                                await client.EnqueueAsync(resMsg, ct);
                             }
                             catch (Exception ex)
                             {
@@ -295,26 +291,21 @@ public sealed class Leader
         }
     }
 
-    // async void を排除。Task を返し、内部で例外捕捉。
+    // Task を返し、内部で例外捕捉。送信は専用キューへ投入し、接続ごとの送信ループが直列送信する。
     private async Task SendAssignAsync(WorkerConn wc, JobEnvelope job, int attempt)
     {
         try
         {
-            await wc.SendLock.WaitAsync();
-            try
+            var msg = new Message
             {
-                await Codec.WriteAsync(wc.Stream, new Message
-                {
-                    Type = MsgType.AssignJob,
-                    MsgId = job.JobId,
-                    Subject = $"job.assign.{job.ExecName}.{wc.WorkerId}",
-                    Payload = job.RawPayload
-                }, CancellationToken.None);
-            }
-            finally
-            {
-                wc.SendLock.Release();
-            }
+                Type = MsgType.AssignJob,
+                MsgId = job.JobId,
+                Subject = $"job.assign.{job.ExecName}.{wc.WorkerId}",
+                Payload = job.RawPayload
+            };
+
+            // 送信は直書きせず、キューに投入（満杯なら自然に待機→バックプレッシャー）
+            await wc.EnqueueAsync(msg, CancellationToken.None);
 
             wc.Credit--;
             wc.Running++;
@@ -387,12 +378,44 @@ public sealed class Leader
     {
         public string ClientId { get; }
         public NetworkStream Stream { get; }
+        public Channel<Message> Outbox { get; }
+        public Task SendLoop { get; }
+        private readonly CancellationTokenSource _cts = new();
 
-        /// <summary>
-        /// 同一Clientへの送信直列化
-        /// </summary>
-        public SemaphoreSlim SendLock { get; } = new(1, 1);
-        public ClientConn(string id, NetworkStream s) { ClientId = id; Stream = s; }
+        public ClientConn(string id, NetworkStream s)
+        {
+            ClientId = id;
+            Stream = s;
+            // バックプレッシャーを効かせるため bounded（例: 1024）
+            Outbox = Channel.CreateBounded<Message>(
+                new BoundedChannelOptions(1024) { FullMode = BoundedChannelFullMode.Wait });
+            SendLoop = Task.Run(() => RunSendLoopAsync(_cts.Token));
+        }
+
+        private async Task RunSendLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                await foreach (var m in Outbox.Reader.ReadAllAsync(ct))
+                {
+                    await Codec.WriteAsync(Stream, m, ct); // 1本のループで直列送信
+                }
+            }
+            catch (OperationCanceledException) { /* normal on shutdown */ }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Leader] client sender error({ClientId}): {ex.Message}");
+            }
+        }
+
+        public async Task EnqueueAsync(Message m, CancellationToken ct)
+            => await Outbox.Writer.WriteAsync(m, ct);
+
+        public void Stop()
+        {
+            try { Outbox.Writer.TryComplete(); } catch { }
+            _cts.Cancel();
+        }
     }
 
     private sealed class WorkerConn
@@ -400,13 +423,12 @@ public sealed class Leader
         public Guid WorkerId { get; }
         public string SubjectPattern { get; }
         public NetworkStream Stream { get; }
-
-        /// <summary>
-        /// 同一Workerへの送信直列化
-        /// </summary>
-        public SemaphoreSlim SendLock { get; } = new(1, 1);
         public int Credit;
         public int Running;
+
+        public Channel<Message> Outbox { get; }
+        public Task SendLoop { get; }
+        private readonly CancellationTokenSource _cts = new();
 
         public WorkerConn(Guid id, NetworkStream s, string pattern)
         {
@@ -415,6 +437,35 @@ public sealed class Leader
             SubjectPattern = pattern;
             Credit = 0;
             Running = 0;
+
+            Outbox = Channel.CreateBounded<Message>(
+                new BoundedChannelOptions(1024) { FullMode = BoundedChannelFullMode.Wait });
+            SendLoop = Task.Run(() => RunSendLoopAsync(_cts.Token));
+        }
+
+        private async Task RunSendLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                await foreach (var m in Outbox.Reader.ReadAllAsync(ct))
+                {
+                    await Codec.WriteAsync(Stream, m, ct); // 1本のループで直列送信
+                }
+            }
+            catch (OperationCanceledException) { /* normal on shutdown */ }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Leader] worker sender error({WorkerId}): {ex.Message}");
+            }
+        }
+
+        public async Task EnqueueAsync(Message m, CancellationToken ct)
+            => await Outbox.Writer.WriteAsync(m, ct);
+
+        public void Stop()
+        {
+            try { Outbox.Writer.TryComplete(); } catch { }
+            _cts.Cancel();
         }
     }
 }
