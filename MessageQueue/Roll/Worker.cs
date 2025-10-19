@@ -1,5 +1,6 @@
 ﻿using MessageQueue.Common;
 using System;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
@@ -79,7 +80,8 @@ public sealed class Worker
 
     private static async Task SendCreditAsync(NetworkStream ns, int credit, CancellationToken ct)
     {
-        var buf = BitConverter.GetBytes(credit);
+        var buf = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(buf, credit);
         await Codec.WriteAsync(ns, new Message { Type = MsgType.Credit, MsgId = Guid.NewGuid(), Payload = buf }, ct);
     }
 
