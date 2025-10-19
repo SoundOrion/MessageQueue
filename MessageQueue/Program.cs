@@ -12,14 +12,14 @@ public static class Program
         // 使い方:
         // dotnet run -- leader 5000
         // dotnet run -- worker 127.0.0.1 5000 job.assign.*
-        // dotnet run -- client 127.0.0.1 5000 clientA
+        // dotnet run -- client 127.0.0.1 5000 clientA [desiredParallelism]
 
         if (args.Length == 0)
         {
             Console.WriteLine("Usage:");
             Console.WriteLine("  leader <port>");
             Console.WriteLine("  worker <host> <port> [pattern]");
-            Console.WriteLine("  client <host> <port> <clientId>");
+            Console.WriteLine("  client <host> <port> <clientId> [desiredParallelism]");
             return;
         }
 
@@ -48,7 +48,9 @@ public static class Program
                     var host = args[1];
                     int port = int.Parse(args[2]);
                     var clientId = args[3];
-                    var cli = new Client(host, port, clientId);
+                    int? desired = null;
+                    if (args.Length > 4 && int.TryParse(args[4], out var d)) desired = d;
+                    var cli = new Client(host, port, clientId, desired);
                     await cli.RunAsync(cts.Token);
                     break;
                 }

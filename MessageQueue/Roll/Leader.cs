@@ -21,7 +21,6 @@ public sealed class Leader
     private readonly ConcurrentDictionary<string, ClientConn> _clients = new();
 
     // WorkerId -> connection
-    // ワーカー一覧は複数スレッドから読むのでロック保護
     private readonly Dictionary<Guid, WorkerConn> _workers = new();
     private readonly object _lock = new();
 
@@ -30,12 +29,15 @@ public sealed class Leader
     private readonly ConcurrentQueue<string> _execRound = new();
     private readonly ConcurrentDictionary<string, byte> _execInRound = new();
 
-    // Submit 重複排除（スレッドセーフに）
-    // 値はダミーの byte。TryAdd で原子的に検査+追加。
+    // Submit 重複排除
     private readonly ConcurrentDictionary<Guid, byte> _submitted = new();
 
     // In-flight
     private readonly ConcurrentDictionary<Guid, Inflight> _inflight = new();
+
+    // ★ 追加: Clientごとの希望上限と現在のin-flight数
+    private readonly ConcurrentDictionary<string, int> _clientCap = new();
+    private readonly ConcurrentDictionary<string, int> _clientInflight = new();
 
     // 再送パラメータ
     private static readonly TimeSpan InitialAckTimeout = TimeSpan.FromSeconds(1);
@@ -104,9 +106,25 @@ public sealed class Leader
         {
             // ClientId は Subject に入れて名乗る
             var clientId = string.IsNullOrWhiteSpace(hello.Subject) ? Guid.NewGuid().ToString("N") : hello.Subject;
+
+            // ★ 追加: 希望並列数の取得（payloadがあれば）
+            int cap = 4; // 既定
+            try
+            {
+                if (hello.Payload is { Length: > 0 })
+                {
+                    var cfg = JsonSerializer.Deserialize<ClientConfig>(hello.Payload);
+                    if (cfg != null && !string.IsNullOrWhiteSpace(cfg.ClientId) && cfg.ClientId == clientId)
+                        cap = Math.Max(1, cfg.DesiredParallelism);
+                }
+            }
+            catch { /* 無効なpayloadは既定にフォールバック */ }
+            _clientCap[clientId] = cap;
+            _clientInflight[clientId] = 0;
+
             var cc = new ClientConn(clientId, ns);
             _clients[clientId] = cc;
-            Console.WriteLine($"[Leader] Client connected: {clientId}");
+            Console.WriteLine($"[Leader] Client connected: {clientId} cap={cap}");
 
             try
             {
@@ -116,6 +134,8 @@ public sealed class Leader
             {
                 cc.Stop(); // 送信ループ停止
                 _clients.TryRemove(clientId, out _);
+                _clientCap.TryRemove(clientId, out _);
+                _clientInflight.TryRemove(clientId, out _);
                 Console.WriteLine($"[Leader] Client disconnected: {clientId}");
             }
         }
@@ -144,6 +164,8 @@ public sealed class Leader
                     if (_inflight.TryRemove(kv.Key, out var inf))
                     {
                         Enqueue(inf.Job.ExecName, inf.Job);
+                        // ★ Client inflight をデクリメントして再チャレンジできるように
+                        _clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
                         Console.WriteLine($"[Leader] Requeued {inf.Job.JobId} (owner down)");
                     }
                 }
@@ -208,10 +230,10 @@ public sealed class Leader
                 case MsgType.AckJob:
                     if (_inflight.TryRemove(m.CorrId, out var inf))
                     {
-                        //wc.Credit++;
+                        // ★ Ack時にCredit++していた既存コードを削除（ここでは増やさない）
                         wc.Running--;
 
-                        // Worker から結果が届いた場合は Client へ中継
+                        // Client側へ結果中継
                         if (_clients.TryGetValue(inf.Job.ClientId, out var client))
                         {
                             try
@@ -224,18 +246,19 @@ public sealed class Leader
                                     Subject = $"job.result.{inf.Job.ClientId}.{inf.Job.JobId:N}",
                                     Payload = m.Payload
                                 };
-
-                                // 中継は送信キューへ投入（接続単位で直列送信）
                                 await client.EnqueueAsync(resMsg, ct);
                             }
                             catch (Exception ex)
                             {
                                 Console.WriteLine($"[Leader] failed to forward result to client {inf.Job.ClientId}: {ex.Message}");
-                                // 必要ならここで client 用 DLQ などへ退避可能
                             }
                         }
 
+                        // ★ Clientごとのin-flightをデクリメント
+                        _clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+
                         Console.WriteLine($"[Leader] Ack {m.CorrId} from {wc.WorkerId}");
+                        PumpAllExec(); // 次の割り当てを早める
                     }
                     break;
             }
@@ -266,7 +289,8 @@ public sealed class Leader
         if (!_execQueues.TryGetValue(exec, out var queue))
             return;
 
-        while (!queue.IsEmpty)
+        int spinGuard = 0; // 無限ループ防止
+        while (!queue.IsEmpty && spinGuard++ < 1000)
         {
             WorkerConn? target;
             lock (_lock)
@@ -279,19 +303,24 @@ public sealed class Leader
             }
             if (target is null) break;
 
-            if (queue.TryDequeue(out var job))
+            if (!queue.TryDequeue(out var job)) break;
+
+            // ★ Client別の同時実行上限をチェック
+            var cap = _clientCap.GetValueOrDefault(job.ClientId, 4);
+            var cur = _clientInflight.GetValueOrDefault(job.ClientId, 0);
+            if (cur >= cap)
             {
-                // 非同期送信（例外は SendAssignAsync 内で捕捉）
-                _ = SendAssignAsync(target, job, attempt: 1);
-            }
-            else
-            {
+                // 上限超過：末尾へ戻す & 他のジョブを当てる
+                queue.Enqueue(job);
+                // 他のexecへ回ってもらう
                 break;
             }
+
+            // 非同期送信（例外は SendAssignAsync 内で捕捉）
+            _ = SendAssignAsync(target, job, attempt: 1);
         }
     }
 
-    // Task を返し、内部で例外捕捉。送信は専用キューへ投入し、接続ごとの送信ループが直列送信する。
     private async Task SendAssignAsync(WorkerConn wc, JobEnvelope job, int attempt)
     {
         try
@@ -304,11 +333,13 @@ public sealed class Leader
                 Payload = job.RawPayload
             };
 
-            // 送信は直書きせず、キューに投入（満杯なら自然に待機→バックプレッシャー）
             await wc.EnqueueAsync(msg, CancellationToken.None);
 
             wc.Credit--;
             wc.Running++;
+
+            // ★ Client in-flight をインクリメント
+            _clientInflight.AddOrUpdate(job.ClientId, 1, (_, v) => v + 1);
 
             var timeout = attempt == 1 ? InitialAckTimeout : NextTimeoutFor(attempt - 1, InitialAckTimeout);
             _inflight[job.JobId] = new Inflight(job, wc, DateTime.UtcNow + timeout, timeout, attempt);
@@ -336,6 +367,8 @@ public sealed class Leader
             {
                 Console.WriteLine($"[Leader] {inf.Job.JobId} exceeded attempts -> DLQ");
                 _dlq.Enqueue(inf.Job);
+                // ★ in-flight戻し
+                _clientInflight.AddOrUpdate(inf.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
                 continue;
             }
 
@@ -386,7 +419,6 @@ public sealed class Leader
         {
             ClientId = id;
             Stream = s;
-            // バックプレッシャーを効かせるため bounded（例: 1024）
             Outbox = Channel.CreateBounded<Message>(
                 new BoundedChannelOptions(1024) { FullMode = BoundedChannelFullMode.Wait });
             SendLoop = Task.Run(() => RunSendLoopAsync(_cts.Token));
@@ -398,10 +430,10 @@ public sealed class Leader
             {
                 await foreach (var m in Outbox.Reader.ReadAllAsync(ct))
                 {
-                    await Codec.WriteAsync(Stream, m, ct); // 1本のループで直列送信
+                    await Codec.WriteAsync(Stream, m, ct);
                 }
             }
-            catch (OperationCanceledException) { /* normal on shutdown */ }
+            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
                 Console.WriteLine($"[Leader] client sender error({ClientId}): {ex.Message}");
@@ -449,10 +481,10 @@ public sealed class Leader
             {
                 await foreach (var m in Outbox.Reader.ReadAllAsync(ct))
                 {
-                    await Codec.WriteAsync(Stream, m, ct); // 1本のループで直列送信
+                    await Codec.WriteAsync(Stream, m, ct);
                 }
             }
-            catch (OperationCanceledException) { /* normal on shutdown */ }
+            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
                 Console.WriteLine($"[Leader] worker sender error({WorkerId}): {ex.Message}");

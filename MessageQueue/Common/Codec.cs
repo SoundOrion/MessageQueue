@@ -13,6 +13,9 @@ namespace MessageQueue.Common;
 //        [payloadLen:4LE][payload:..]
 public static class Codec
 {
+    // ★ 追加: 安全のための上限（必要に応じて調整）
+    private const int MaxBodyLength = 4 * 1024 * 1024; // 4MB
+
     public static async Task WriteAsync(NetworkStream ns, Message m, CancellationToken ct)
     {
         var subBytes = Encoding.UTF8.GetBytes(m.Subject ?? "");
@@ -42,6 +45,9 @@ public static class Codec
         var lenBuf = await ReadExactAsync(ns, 4, ct);
         if (lenBuf is null) return null;
         int bodyLen = BinaryPrimitives.ReadInt32LittleEndian(lenBuf);
+
+        // ★ 追加: 異常サイズ防止
+        if (bodyLen <= 0 || bodyLen > MaxBodyLength) return null;
 
         var body = await ReadExactAsync(ns, bodyLen, ct);
         if (body is null) return null;

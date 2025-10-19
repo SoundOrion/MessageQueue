@@ -10,8 +10,19 @@ namespace MessageQueue.Roll;
 
 public sealed class Client
 {
-    private readonly string _host; private readonly int _port; private readonly string _clientId;
-    public Client(string host, int port, string clientId) { _host = host; _port = port; _clientId = clientId; }
+    private readonly string _host;
+    private readonly int _port;
+    private readonly string _clientId;
+    private readonly int _desiredParallelism;
+
+    // desiredParallelismは引数で指定。nullの場合は環境変数CLIENT_DESIRED_PAR、さらに無ければ4。
+    public Client(string host, int port, string clientId, int? desiredParallelism = null)
+    {
+        _host = host; _port = port; _clientId = clientId;
+        if (desiredParallelism.HasValue) _desiredParallelism = Math.Max(1, desiredParallelism.Value);
+        else if (int.TryParse(Environment.GetEnvironmentVariable("CLIENT_DESIRED_PAR"), out var p)) _desiredParallelism = Math.Max(1, p);
+        else _desiredParallelism = 4;
+    }
 
     public async Task RunAsync(CancellationToken ct)
     {
@@ -19,8 +30,14 @@ public sealed class Client
         await cli.ConnectAsync(_host, _port, ct);
         using var ns = cli.GetStream();
 
-        // Hello（ClientId を Subject で名乗る）
-        await Codec.WriteAsync(ns, new Message { Type = MsgType.HelloClient, Subject = _clientId }, ct);
+        // ★ Hello（SubjectにClientId, PayloadにDesiredParallelismを入れて名乗る）
+        var cfg = new ClientConfig(_clientId, _desiredParallelism);
+        await Codec.WriteAsync(ns, new Message
+        {
+            Type = MsgType.HelloClient,
+            Subject = _clientId,
+            Payload = JsonSerializer.SerializeToUtf8Bytes(cfg)
+        }, ct);
 
         // サンプル：calcA に 3 ジョブ投げる
         for (int i = 0; i < 3; i++)
@@ -55,9 +72,16 @@ public sealed class Client
             if (m is null) break;
             if (m.Type == MsgType.Result)
             {
-                var res = JsonSerializer.Deserialize<JobResult>(m.Payload)!;
-                Console.WriteLine($"[Client {_clientId}] RESULT {res.JobId} status={res.Status} stdout={res.Stdout.Trim()} stderr={res.Stderr.Trim()} archive={(res.OutputArchive?.Length ?? 0)}B");
-                received++;
+                try
+                {
+                    var res = JsonSerializer.Deserialize<JobResult>(m.Payload)!;
+                    Console.WriteLine($"[Client {_clientId}] RESULT {res.JobId} status={res.Status} stdout={res.Stdout.Trim()} stderr={res.Stderr.Trim()} archive={(res.OutputArchive?.Length ?? 0)}B");
+                    received++;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Client {_clientId}] bad result payload: {ex.Message}");
+                }
             }
         }
     }
