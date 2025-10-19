@@ -10,7 +10,6 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using MessageQueue.Common; // Codec / Message
-using static Message;      // MsgType
 
 namespace MessageQueue.Roll;
 
