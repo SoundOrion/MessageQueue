@@ -1,0 +1,90 @@
+すばらしい！
+今アップされた最新版（`Leader.cs`, `ClusterNode.cs`, `Persistence.cs`, `Message.cs` など）では、**Raft RPC** (`AppendEntries`, `RequestVote`) に関する定義と、**状態永続化/復元の型** はすでに正しく揃っています。
+
+あなたの次のステップは、このセットを統合して動作検証（Phase 1/Phase 2）できるようにすることです。以下に最終調整ポイントをまとめます。
+
+---
+
+## ✅ Leader.cs でやるべきこと
+
+1. **Raft RPC ハンドラを導入**
+   → すでに私が提示した `TryHandleClusterRpcAsync` をそのまま Leader クラスに追加。
+
+2. **接続ハンドラ（HandleConnAsync）冒頭で分岐**
+
+   ```csharp
+   var first = await Codec.ReadAsync(ns, ct);
+   if (await TryHandleClusterRpcAsync(ns, first, ct))
+       return; // ← AppendEntries / RequestVote は即リプライして終了
+   ```
+
+3. **Leader コンストラクタまたは起動時に `_raft` を初期化**
+
+   ```csharp
+   _raft = new ClusterNode(_group, _port, peers, OnCommittedAsync);
+   _raft.Start();
+   ```
+
+4. **OnCommittedAsync** を既に提案した完全版で追加（enqueue/assign/ack/requeue/dlq 全処理含む）。
+
+---
+
+## ✅ ClusterNode.cs について
+
+* ファイル内に `MsgType.AppendEntries`, `RequestVote`, `AppendResp`, `VoteResp` を使っている箇所があるので、`Message.cs` の列挙値と一致しており問題ありません。
+* `"Value"` エラーは、`JsonElement` から直接 `GetProperty("X").GetString()` / `GetInt32()` に書き換え済みで解消済みのはずです。
+* null リテラル → `JsonElement?` の扱いを `entryElem` のように nullable にしているので、これも問題ありません。
+
+---
+
+## ✅ Persistence.cs の型一致（重要）
+
+Leader 側の `InflightWire` コンストラクタ呼び出しが
+
+```csharp
+new InflightWire(JobWire job, Guid? OwnerWorker, DateTime DueAt, TimeSpan Timeout, int Attempt)
+```
+
+で揃うように、定義済み。
+もし以前のコードに `owner` だけの引数があった場合は、ここを `OwnerWorker` に直すだけでOKです。
+
+---
+
+## ✅ Message.cs の補足
+
+`MsgType` にすべての Raft RPC 種類が含まれているため、
+`ClusterNode` も `Leader` もコンパイルエラーは消えるはずです。
+
+---
+
+## ✅ ビルド時によく出る警告
+
+* “await 演算子がないため同期的に実行されます” →
+  `async Task` で `await` が不要なメソッド（たとえば `OnRequestVote` が同期）なら
+  → `Task.CompletedTask` を返すか `async` を外して `void` / `ValueTask` に。
+
+---
+
+## ✅ 次にテストする順序
+
+### Phase 1（最小導入）
+
+1. Leader 1台固定
+
+   * `ClusterNode` は `Start()` 呼び出しのみで、自動選挙を無効化。
+   * 他ノードは `NotLeader` 応答を返すのみ。
+2. `ClientMulti` から SubmitJob → Worker が AckJob → Leader が Result 転送できることを確認。
+3. Leader を kill → restart → `Persistence` の snapshot / WAL から復元されることを確認。
+
+### Phase 2（自動選挙）
+
+1. `ClusterNode` の `RequestVote` / `AppendEntries` タイマーを有効化。
+2. 選挙勝利後、Follower が AppendEntries を受け取り、log が同期することを確認。
+3. Leader kill → Follower が再選 → 再稼働後にログ一致するか検証。
+
+---
+
+もし希望があれば：
+
+* Leader.cs + ClusterNode.cs + Persistence.cs を統合した **「3ノード自動選挙の最小サンプルMain()」** も出せます。
+  欲しいですか？

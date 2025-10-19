@@ -1,0 +1,254 @@
+お待たせ！`Leader` にぶら下げる **`OnCommittedAsync(object entry)` の“全部入り”実装**を置きます。
+Raft（`ClusterNode`）から **コミット確定**で呼ばれる想定です。WALごとに**副作用を一か所に集約**し、**冪等**になるよう注意しています。
+
+> 方針：
+>
+> * `enqueue`…必ずキューへ（重複は `_submitted` を見て安全に）
+> * `assign`…既に送っている場合は **no-op**。未送なら **in-flight 登録だけ補整**（最小差分）。
+>
+>   * 「厳密に commit 後にだけ送る」モードに切り替えるスイッチも載せています。
+> * `ack` / `timeout_requeue` / `worker_down_requeue` / `dlq`…**in-flight 更新＋キュー/DLQ** を同期
+
+---
+
+## 1) Leader.cs にメソッドを追加
+
+```csharp
+// Leader.cs 内（クラススコープ）に貼り付け
+// -------------------------------------------------------------
+
+// 必要ならトップに using を追加
+// using System.Text.Json; // すでにあれば不要
+
+// assign を “commit 後にだけ送る” 厳密モードへ切替える場合は true に。
+// まずは false（現状の送信→Append を尊重）を推奨。
+private const bool STRICT_ASSIGN_AFTER_COMMIT = false;
+
+private async Task OnCommittedAsync(object entry)
+{
+    switch (entry)
+    {
+        case WalEnqueue enq:
+        {
+            // 二重Submit防止（WALは複製されるため冪等に）
+            if (_submitted.TryAdd(enq.job.JobId, 0))
+            {
+                var env = new JobEnvelope(enq.job.JobId, enq.job.ClientId, enq.job.ExecName, enq.job.RawPayload);
+                Enqueue(enq.job.ExecName, env);
+                Console.WriteLine($"[Leader][commit] enqueue {enq.job.JobId} exec={enq.job.ExecName}");
+                PumpAllExec();
+            }
+            break;
+        }
+
+        case WalAssign asg:
+        {
+            // 最小差分: 既に送信済（_inflightにある）なら no-op にする。
+            if (_inflight.ContainsKey(asg.jobId))
+                break;
+
+            if (!STRICT_ASSIGN_AFTER_COMMIT)
+            {
+                // 現状フロー（送信→Append）の補整：in-flight が無いなら “観測済み送信” に整合する程度に埋める
+                // ジョブ本体を探す（キュー内 or どこにも無ければ諦め）
+                JobEnvelope? found = null;
+
+                // 1) exec キューから探す（先頭から一時退避して戻す）
+                if (TryFindAndRemoveFromQueues(asg.jobId, out found, out var exec))
+                {
+                    // この時点で found != null
+                }
+                else
+                {
+                    // 2) DLQにいたら戻さない（assignとDLQが並立することは通常ない）→ no-op
+                }
+
+                if (found is not null)
+                {
+                    // Owner は unknown（再接続まで null 扱い）。Client inflight を+1
+                    _clientInflight.AddOrUpdate(found.ClientId, 1, (_, v) => v + 1);
+                    var timeout = NextTimeoutFor(Math.Max(0, asg.attempt - 1), InitialAckTimeout);
+                    _inflight[found.JobId] = new Inflight(found, owner: null!, DateTime.UtcNow + timeout, timeout, asg.attempt);
+                    Console.WriteLine($"[Leader][commit] assign补正 {found.JobId} attempt={asg.attempt}");
+                    PumpAllExec();
+                }
+                // 見つからなければ既にAck済み等なので no-op
+            }
+            else
+            {
+                // 厳密モード：commit を受けてから初めて送る
+                JobEnvelope? found = null;
+                string? exec = null;
+
+                if (!TryFindAndRemoveFromQueues(asg.jobId, out found, out exec))
+                {
+                    // キューになければ、既に送っているか終了している。no-op
+                    break;
+                }
+
+                // 対象 worker を選定して送る（attempt は WAL に従う）
+                WorkerConn? target;
+                lock (_lock)
+                {
+                    target = _workers.Values
+                        .Where(w => w.Credit > 0 && SubjectMatcher.Match(w.SubjectPattern, $"job.assign.{exec}"))
+                        .OrderBy(w => w.Running)
+                        .ThenByDescending(w => w.Credit)
+                        .FirstOrDefault();
+                }
+                if (target is null)
+                {
+                    // 送れなければキューへ戻す
+                    Enqueue(exec!, found);
+                    break;
+                }
+
+                await SendAssignAsync(target, found, asg.attempt);
+            }
+            break;
+        }
+
+        case WalAck ack:
+        {
+            if (_inflight.TryRemove(ack.jobId, out var inf))
+            {
+                _clientInflight.AddOrUpdate(ack.clientId, 0, (_, v) => Math.Max(0, v - 1));
+                Console.WriteLine($"[Leader][commit] ack {ack.jobId}");
+                PumpAllExec();
+            }
+            break;
+        }
+
+        case WalTimeoutRequeue tr:
+        {
+            if (_inflight.TryRemove(tr.jobId, out var inf2))
+            {
+                Enqueue(inf2.Job.ExecName, inf2.Job);
+                _clientInflight.AddOrUpdate(inf2.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+                Console.WriteLine($"[Leader][commit] timeout_requeue {tr.jobId}");
+                PumpAllExec();
+            }
+            break;
+        }
+
+        case WalWorkerDownRequeue wr:
+        {
+            if (_inflight.TryRemove(wr.jobId, out var inf3))
+            {
+                Enqueue(inf3.Job.ExecName, inf3.Job);
+                _clientInflight.AddOrUpdate(inf3.Job.ClientId, 0, (_, v) => Math.Max(0, v - 1));
+                Console.WriteLine($"[Leader][commit] worker_down_requeue {wr.jobId}");
+                PumpAllExec();
+            }
+            break;
+        }
+
+        case WalDlq dlq:
+        {
+            if (_inflight.TryRemove(dlq.jobId, out var inf4))
+            {
+                _dlq.Enqueue(inf4.Job);
+                Console.WriteLine($"[Leader][commit] dlq {dlq.jobId}");
+            }
+            break;
+        }
+    }
+
+    await Task.CompletedTask;
+}
+
+// ---- 小さな補助：exec全キューから特定JobIdを吸い出す ---------------------
+private bool TryFindAndRemoveFromQueues(Guid jobId, out JobEnvelope? found, out string? execName)
+{
+    found = null; execName = null;
+
+    foreach (var kv in _execQueues)
+    {
+        var exec = kv.Key;
+        var q = kv.Value;
+
+        if (q.IsEmpty) continue;
+
+        // 一旦全部吐き出して探し、なければ戻す
+        var temp = new List<JobEnvelope>(q.Count + 4);
+        while (q.TryDequeue(out var x))
+        {
+            if (found is null && x.JobId == jobId)
+            {
+                found = x; execName = exec;
+            }
+            else
+            {
+                temp.Add(x);
+            }
+        }
+        // 戻す
+        foreach (var x in temp) q.Enqueue(x);
+
+        if (found is not null)
+        {
+            // ラウンドロビン管理の修正
+            if (!q.IsEmpty)
+            {
+                if (_execInRound.TryAdd(exec, 1))
+                    _execRound.Enqueue(exec);
+            }
+            else
+            {
+                _execInRound.TryRemove(exec, out _);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+---
+
+## 2) どこで呼ばれるか
+
+* すでに `ClusterNode` を初期化するときに `OnCommittedAsync` を渡しているなら OK。
+
+  ```csharp
+  _raft = new ClusterNode(groupId, port, peers ?? Array.Empty<string>(), OnCommittedAsync);
+  _raft.Start();
+  ```
+* 既存のイベント送出箇所（`enqueue/assign/ack/...`）は、**Raft有効時**は `_raft.AppendAndReplicateAsync(new WalXxx(...))` を呼ぶようにしておいてください（前回の差分どおり）。
+
+---
+
+## 3) 厳密モードへの切替（任意）
+
+`STRICT_ASSIGN_AFTER_COMMIT = true` にすると、**`WalAssign` コミットを受けて初めて `SendAssignAsync`** を呼びます。
+この場合は **「送信→Append」** の既存順序と食い違うため、**割当を作る側**（`TryAssignExec` 内）を次のように変更します：
+
+```csharp
+// 送信する代わりに「Assign をWALに書く」→ 過半数 commit → OnCommitted で SendAssignAsync
+if (_raft is null)
+{
+    // 旧来：送ってから append
+    _ = SendAssignAsync(target, job, attempt: 1);
+}
+else
+{
+    await _raft.AppendAndReplicateAsync(
+        new WalAssign("assign", DateTime.UtcNow, job.JobId, target.WorkerId, attempt: 1),
+        CancellationToken.None);
+    // 送信は OnCommittedAsync(WalAssign) に任せる
+}
+```
+
+> まずは `STRICT_ASSIGN_AFTER_COMMIT = false` で動作確認 → 問題なければ true に切り替えるのが安全です。
+
+---
+
+## 4) これで揃うこと
+
+* **Raft commit が唯一の「状態変更トリガ」**（enqueue/ack/requeue/dlq）
+* `assign` は最小差分では **補整的に in-flight を埋める**だけ（既送に追随）
+* 厳密にしたい場合はスイッチひとつで「commit 後送信」に反転できます
+
+---
+
+他のファイルの該当行（`TryAssignExec` や `SendAssignAsync` 差分）も必要なら、その部分を貼ってくれれば **適用済みの完全差分**にして返します。
