@@ -215,14 +215,22 @@ public sealed class Leader
                         {
                             try
                             {
-                                await Codec.WriteAsync(client.Stream, new Message
+                                await client.SendLock.WaitAsync(ct);
+                                try
                                 {
-                                    Type = MsgType.Result,
-                                    MsgId = inf.Job.JobId,
-                                    CorrId = inf.Job.JobId,
-                                    Subject = $"job.result.{inf.Job.ClientId}.{inf.Job.JobId:N}",
-                                    Payload = m.Payload
-                                }, ct);
+                                    await Codec.WriteAsync(client.Stream, new Message
+                                    {
+                                        Type = MsgType.Result,
+                                        MsgId = inf.Job.JobId,
+                                        CorrId = inf.Job.JobId,
+                                        Subject = $"job.result.{inf.Job.ClientId}.{inf.Job.JobId:N}",
+                                        Payload = m.Payload
+                                    }, ct);
+                                }
+                                finally
+                                {
+                                    client.SendLock.Release();
+                                }
                             }
                             catch (Exception ex)
                             {
@@ -292,13 +300,21 @@ public sealed class Leader
     {
         try
         {
-            await Codec.WriteAsync(wc.Stream, new Message
+            await wc.SendLock.WaitAsync();
+            try
             {
-                Type = MsgType.AssignJob,
-                MsgId = job.JobId,
-                Subject = $"job.assign.{job.ExecName}.{wc.WorkerId}",
-                Payload = job.RawPayload
-            }, CancellationToken.None);
+                await Codec.WriteAsync(wc.Stream, new Message
+                {
+                    Type = MsgType.AssignJob,
+                    MsgId = job.JobId,
+                    Subject = $"job.assign.{job.ExecName}.{wc.WorkerId}",
+                    Payload = job.RawPayload
+                }, CancellationToken.None);
+            }
+            finally
+            {
+                wc.SendLock.Release();
+            }
 
             wc.Credit--;
             wc.Running++;
@@ -371,6 +387,11 @@ public sealed class Leader
     {
         public string ClientId { get; }
         public NetworkStream Stream { get; }
+
+        /// <summary>
+        /// 同一Clientへの送信直列化
+        /// </summary>
+        public SemaphoreSlim SendLock { get; } = new(1, 1);
         public ClientConn(string id, NetworkStream s) { ClientId = id; Stream = s; }
     }
 
@@ -379,6 +400,11 @@ public sealed class Leader
         public Guid WorkerId { get; }
         public string SubjectPattern { get; }
         public NetworkStream Stream { get; }
+
+        /// <summary>
+        /// 同一Workerへの送信直列化
+        /// </summary>
+        public SemaphoreSlim SendLock { get; } = new(1, 1);
         public int Credit;
         public int Running;
 
