@@ -20,6 +20,7 @@ public sealed class Leader
     private readonly ConcurrentDictionary<string, ClientConn> _clients = new();
 
     // WorkerId -> connection
+    // ワーカー一覧は複数スレッドから読むのでロック保護
     private readonly Dictionary<Guid, WorkerConn> _workers = new();
     private readonly object _lock = new();
 
@@ -28,13 +29,14 @@ public sealed class Leader
     private readonly ConcurrentQueue<string> _execRound = new();
     private readonly ConcurrentDictionary<string, byte> _execInRound = new();
 
-    // Submit重複排除
-    private readonly HashSet<Guid> _submitted = new();
+    // Submit 重複排除（スレッドセーフに）
+    // 値はダミーの byte。TryAdd で原子的に検査+追加。
+    private readonly ConcurrentDictionary<Guid, byte> _submitted = new();
 
     // In-flight
     private readonly ConcurrentDictionary<Guid, Inflight> _inflight = new();
 
-    // 再送
+    // 再送パラメータ
     private static readonly TimeSpan InitialAckTimeout = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan MaxAckTimeout = TimeSpan.FromSeconds(30);
     private const double BackoffFactor = 2.0;
@@ -50,9 +52,24 @@ public sealed class Leader
     public Leader(int port)
     {
         _listener = new TcpListener(IPAddress.Any, port);
+
+        // 送信タイムアウトなどは、必要なら TcpClient 側で設定する（ここでは既存設計に合わせる）
+
+        // 定期チェック（タイムアウト監視 + スケジューリング）
         _pumpTimer = new System.Timers.Timer(200);
-        _pumpTimer.Elapsed += (_, __) => { CheckTimeouts(); PumpAllExec(); };
         _pumpTimer.AutoReset = true;
+        _pumpTimer.Elapsed += (_, __) =>
+        {
+            try
+            {
+                CheckTimeouts();
+                PumpAllExec();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Leader] pump error: {ex.Message}");
+            }
+        };
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -60,10 +77,19 @@ public sealed class Leader
         _listener.Start();
         _pumpTimer.Start();
         Console.WriteLine("[Leader] listening...");
-        while (!ct.IsCancellationRequested)
+
+        try
         {
-            var c = await _listener.AcceptTcpClientAsync(ct);
-            _ = Task.Run(() => HandleConnAsync(c, ct));
+            while (!ct.IsCancellationRequested)
+            {
+                var c = await _listener.AcceptTcpClientAsync(ct);
+                _ = Task.Run(() => HandleConnAsync(c, ct), ct);
+            }
+        }
+        finally
+        {
+            _pumpTimer.Stop();
+            _listener.Stop();
         }
     }
 
@@ -82,10 +108,15 @@ public sealed class Leader
             var cc = new ClientConn(clientId, ns);
             _clients[clientId] = cc;
             Console.WriteLine($"[Leader] Client connected: {clientId}");
-            try { await HandleClientAsync(cc, ct); }
-            finally { 
-                _clients.TryRemove(clientId, out _); 
-                Console.WriteLine($"[Leader] Client disconnected: {clientId}"); 
+
+            try
+            {
+                await HandleClientAsync(cc, ct);
+            }
+            finally
+            {
+                _clients.TryRemove(clientId, out _);
+                Console.WriteLine($"[Leader] Client disconnected: {clientId}");
             }
         }
         else if (hello.Type == MsgType.HelloWorker)
@@ -97,12 +128,16 @@ public sealed class Leader
             lock (_lock) _workers[workerId] = wc;
             Console.WriteLine($"[Leader] Worker {workerId} joined ({pattern})");
 
-            try { await HandleWorkerAsync(wc, ct); }
+            try
+            {
+                await HandleWorkerAsync(wc, ct);
+            }
             finally
             {
                 lock (_lock) _workers.Remove(workerId);
                 Console.WriteLine($"[Leader] Worker disconnected: {workerId}");
-                // in-flight の回収
+
+                // in-flight の回収（担当者が落ちた分を再投入）
                 foreach (var kv in _inflight.Where(kv => ReferenceEquals(kv.Value.Owner, wc)).ToArray())
                 {
                     if (_inflight.TryRemove(kv.Key, out var inf))
@@ -125,8 +160,12 @@ public sealed class Leader
 
             if (m.Type == MsgType.SubmitJob)
             {
-                if (_submitted.Contains(m.MsgId)) { Console.WriteLine("[Leader] dup submit ignored"); continue; }
-                _submitted.Add(m.MsgId);
+                // 原子的に重複チェック + 追加
+                if (!_submitted.TryAdd(m.MsgId, 0))
+                {
+                    Console.WriteLine("[Leader] dup submit ignored");
+                    continue;
+                }
 
                 var req = JsonSerializer.Deserialize<JobRequest>(m.Payload)!;
                 var exec = req.ExecName;
@@ -144,7 +183,10 @@ public sealed class Leader
     {
         var q = _execQueues.GetOrAdd(exec, _ => new ConcurrentQueue<JobEnvelope>());
         q.Enqueue(job);
-        if (_execInRound.TryAdd(exec, 1)) _execRound.Enqueue(exec);
+
+        // ラウンドロビン対象に登録（重複抑止は _execInRound で）
+        if (_execInRound.TryAdd(exec, 1))
+            _execRound.Enqueue(exec);
     }
 
     // ===== Workers =====
@@ -158,25 +200,37 @@ public sealed class Leader
             switch (m.Type)
             {
                 case MsgType.Credit:
-                    wc.Credit++; PumpAllExec();
+                    wc.Credit++;
+                    PumpAllExec();
                     break;
 
                 case MsgType.AckJob:
                     if (_inflight.TryRemove(m.CorrId, out var inf))
                     {
-                        wc.Credit++; wc.Running--;
-                        // ここで Worker から結果を含む ACK が届いた場合は、Payload を Client へ中継
+                        wc.Credit++;
+                        wc.Running--;
+
+                        // Worker から結果が届いた場合は Client へ中継
                         if (_clients.TryGetValue(inf.Job.ClientId, out var client))
                         {
-                            await Codec.WriteAsync(client.Stream, new Message
+                            try
                             {
-                                Type = MsgType.Result,
-                                MsgId = inf.Job.JobId,
-                                CorrId = inf.Job.JobId,
-                                Subject = $"job.result.{inf.Job.ClientId}.{inf.Job.JobId:N}",
-                                Payload = m.Payload
-                            }, ct);
+                                await Codec.WriteAsync(client.Stream, new Message
+                                {
+                                    Type = MsgType.Result,
+                                    MsgId = inf.Job.JobId,
+                                    CorrId = inf.Job.JobId,
+                                    Subject = $"job.result.{inf.Job.ClientId}.{inf.Job.JobId:N}",
+                                    Payload = m.Payload
+                                }, ct);
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"[Leader] failed to forward result to client {inf.Job.ClientId}: {ex.Message}");
+                                // 必要ならここで client 用 DLQ などへ退避可能
+                            }
                         }
+
                         Console.WriteLine($"[Leader] Ack {m.CorrId} from {wc.WorkerId}");
                     }
                     break;
@@ -187,10 +241,13 @@ public sealed class Leader
     // ===== Scheduling =====
     private void PumpAllExec()
     {
+        // ラウンドロビンで exec ごとに割り当てを試みる
         int n = _execRound.Count;
         for (int i = 0; i < n; i++)
         {
-            if (!_execRound.TryDequeue(out var exec)) break;
+            if (!_execRound.TryDequeue(out var exec))
+                break;
+
             TryAssignExec(exec);
 
             if (_execQueues.TryGetValue(exec, out var q) && !q.IsEmpty)
@@ -202,7 +259,8 @@ public sealed class Leader
 
     private void TryAssignExec(string exec)
     {
-        if (!_execQueues.TryGetValue(exec, out var queue)) return;
+        if (!_execQueues.TryGetValue(exec, out var queue))
+            return;
 
         while (!queue.IsEmpty)
         {
@@ -218,13 +276,19 @@ public sealed class Leader
             if (target is null) break;
 
             if (queue.TryDequeue(out var job))
-                SendAssign(target, job, attempt: 1);
+            {
+                // 非同期送信（例外は SendAssignAsync 内で捕捉）
+                _ = SendAssignAsync(target, job, attempt: 1);
+            }
             else
+            {
                 break;
+            }
         }
     }
 
-    private async void SendAssign(WorkerConn wc, JobEnvelope job, int attempt)
+    // async void を排除。Task を返し、内部で例外捕捉。
+    private async Task SendAssignAsync(WorkerConn wc, JobEnvelope job, int attempt)
     {
         try
         {
@@ -236,7 +300,9 @@ public sealed class Leader
                 Payload = job.RawPayload
             }, CancellationToken.None);
 
-            wc.Credit--; wc.Running++;
+            wc.Credit--;
+            wc.Running++;
+
             var timeout = attempt == 1 ? InitialAckTimeout : NextTimeoutFor(attempt - 1, InitialAckTimeout);
             _inflight[job.JobId] = new Inflight(job, wc, DateTime.UtcNow + timeout, timeout, attempt);
 
@@ -252,6 +318,7 @@ public sealed class Leader
     private void CheckTimeouts()
     {
         var now = DateTime.UtcNow;
+
         foreach (var kv in _inflight.ToArray())
         {
             var inf = kv.Value;
@@ -269,12 +336,16 @@ public sealed class Leader
             lock (_lock)
             {
                 target = _workers.Values
-                    .Where(w => w.Credit > 0 && !ReferenceEquals(w, inf.Owner) && SubjectMatcher.Match(w.SubjectPattern, $"job.assign.{inf.Job.ExecName}"))
+                    .Where(w => w.Credit > 0
+                                && !ReferenceEquals(w, inf.Owner)
+                                && SubjectMatcher.Match(w.SubjectPattern, $"job.assign.{inf.Job.ExecName}"))
                     .OrderBy(w => w.Running)
                     .ThenByDescending(w => w.Credit)
-                    .FirstOrDefault() ?? inf.Owner;
+                    .FirstOrDefault()
+                    ?? inf.Owner; // 代替が無ければ元のオーナーへ再送
             }
-            SendAssign(target!, inf.Job, inf.Attempt + 1);
+
+            _ = SendAssignAsync(target!, inf.Job, inf.Attempt + 1);
         }
     }
 
@@ -284,9 +355,12 @@ public sealed class Leader
         var jitter = 1.0 + ((_rng.Value!.NextDouble() * 2 - 1) * JitterRate);
         return TimeSpan.FromMilliseconds(Math.Max(1, baseMs * jitter));
     }
+
     private static TimeSpan NextTimeoutFor(int n, TimeSpan initial)
     {
-        var t = initial; for (int i = 0; i < n; i++) t = NextTimeout(t); return t;
+        var t = initial;
+        for (int i = 0; i < n; i++) t = NextTimeout(t);
+        return t;
     }
 
     // ==== inner types ====
@@ -307,7 +381,14 @@ public sealed class Leader
         public NetworkStream Stream { get; }
         public int Credit;
         public int Running;
+
         public WorkerConn(Guid id, NetworkStream s, string pattern)
-        { WorkerId = id; Stream = s; SubjectPattern = pattern; Credit = 0; Running = 0; }
+        {
+            WorkerId = id;
+            Stream = s;
+            SubjectPattern = pattern;
+            Credit = 0;
+            Running = 0;
+        }
     }
 }
