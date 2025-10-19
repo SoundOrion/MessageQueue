@@ -27,7 +27,7 @@ public static class Codec
         await ns.WriteAsync(m.CorrId.ToByteArray(), ct);
 
         var sbl = new byte[2];
-        BinaryPrimitives.WriteInt16LittleEndian(sbl, (short)subBytes.Length);
+        BinaryPrimitives.WriteUInt16LittleEndian(sbl, (ushort)subBytes.Length);
         await ns.WriteAsync(sbl, ct);
         if (subBytes.Length > 0) await ns.WriteAsync(subBytes, ct);
 
@@ -52,7 +52,7 @@ public static class Codec
         var corr = new Guid(span.Slice(17, 16));
 
         int ofs = 33;
-        int subLen = BinaryPrimitives.ReadInt16LittleEndian(span.Slice(ofs, 2)); ofs += 2;
+        int subLen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(ofs, 2)); ofs += 2;
         string subject = subLen == 0 ? "" : Encoding.UTF8.GetString(span.Slice(ofs, subLen)); ofs += subLen;
 
         int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(ofs, 4)); ofs += 4;
