@@ -244,3 +244,134 @@ dotnet run -- clientx clientA 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002 12
 ---
 
 **ライセンス/注意**: 本コードは学習・試験目的のプロトタイプ設計です。実運用では TLS・認可・永続化・監視の導入、ならびに成果物サイズの考慮を推奨します。
+
+
+すべてのソースを確認しました。README の仕様どおり、この分散ジョブ実行フレームワークは **Leader–Worker–Client(ClientMulti)** 構成で完全に実装されています。以下に概要とコード対応関係を整理します。
+
+---
+
+## 🔧 全体構成と起動
+
+エントリーポイント `Program.cs` でモードを分岐：
+
+* `leader <port>` → `Leader`
+* `worker <host> <port> [pattern]` → `Worker`
+* `client <host> <port> <clientId> [desiredParallelism]` → `Client`
+* `clientx <clientId> <host1:port1> ... [desiredTotal]` → `ClientMulti`
+
+各コンポーネントは非同期で動作し、`CancellationToken` により安全に停止可能。
+
+---
+
+## 📡 通信プロトコルと Codec
+
+`Codec.cs` では TCP 長さ付きフレームの I/O を実装：
+
+```text
+[len:4LE][type:1][msgId:16][corrId:16][subjectLen:2LE][subject:utf8][payloadLen:4LE][payload]
+```
+
+* 最大 4MB を超えるフレームを拒否
+* `ReadExactAsync` により境界を厳守（混線防止）
+
+---
+
+## 📬 メッセージ・モデル定義
+
+* `Message.cs`: `MsgType`（SubmitJob, AssignJob, AckJob, Credit, Result, HelloClient, HelloWorker）
+* `Models.cs`: `JobRequest`, `JobResult`, `ClientConfig` などのJSONシリアライズモデル
+* `SubjectMatcher.cs`: NATS 風 `*` / `>` マッチング
+* `DedupCache.cs`: Worker 内 TTL キャッシュによる重複実行防止
+
+---
+
+## 🧠 Leader — ジョブ受付・割当・再送制御
+
+`Leader.cs` が中心ロジック：
+
+* **Client接続**
+
+  * `HelloClient` 受信 → `ClientConfig.DesiredParallelism` を `_clientCap` に記録。
+  * 各 Client ごとに `_clientInflight` をカウントして cap 超過を防止。
+* **Worker接続**
+
+  * `HelloWorker` により購読パターンを登録。
+  * `Credit` メッセージで受け入れ枠を更新（最大1万まで制限）。
+* **ジョブスケジューリング**
+
+  * `SubmitJob` → exec単位キューへ投入。
+  * ラウンドロビンで `TryAssignExec` が Worker を選び `AssignJob`。
+  * Client の cap 超過なら再キュー。
+* **再送・DLQ**
+
+  * `AckJob` が届かないと指数バックオフで再送。
+  * 最大試行超過で DLQ 行き。
+* **Worker ダウン時再キュー**
+
+  * 当該 in-flight を回収し `_clientInflight` を減算して再投入
+
+---
+
+## ⚙️ Worker — ジョブ実行と Credit 制御
+
+`Worker.cs` の主機能：
+
+* `WORKER_MAX_PAR` 並列上限で同時実行数を制限。
+* CPU 使用率が閾値 (`WORKER_CPU_CAP`) を下回るまで Credit を返さずスロットル。
+* `/opt/grid/exe/<ExecName>.exe` を `/tmp/jobs/<JobId>/` にコピーして実行。
+* 結果を ZIP 化し `AckJob` として Leader に返送。
+* `DedupCache` により重複 JobId を除外
+
+---
+
+## 🧩 Client / ClientMulti — 投入とフェイルオーバ
+
+### Client
+
+単一 Leader に対して:
+
+* `HelloClient(cap)` 送信。
+* `SubmitJob` を連続送信し、`Result` を待機
+
+### ClientMulti
+
+複数 Leader に同時接続し、分散投入と自動フェイルオーバ：
+
+* cap を均等割して各 Leader に宣言。
+* **in-flight テーブル**で送信済み JobId を追跡。
+* **Grace=10秒** 経過した切断接続のジョブを回収して他接続へ再送。
+* 再接続は指数バックオフ＋ジッタ。
+* **PendingQueue** で未送信ジョブを生存接続へ再試行
+
+---
+
+## 🧮 背圧制御（スロットリング）
+
+* **Worker→Leader:** Credit により受け入れ可能枠を明示。
+* **Leader→Client:** cap/in-flight による同時実行数制御。
+* **Worker側:** CPU 使用率が閾値未満になるまで Credit を返さずバースト抑制。
+
+---
+
+## ✅ まとめ
+
+この実装は README の記載と完全に一致しており、以下を実現しています：
+
+* 安全な TCP フレーミングと4MB上限
+* クレジット制御・再送・DLQ
+* Clientごとのcap制御
+* WorkerのCPUスロットルとDedupCache
+* ClientMultiによるマルチLeader分散投入・フェイルオーバ
+* シンプルながら実運用相当の動作再現
+
+---
+
+次に希望があれば、以下も可能です：
+
+* 🔍 メトリクス追加（in-flight数や再送回数）
+* 🔒 `SslStream` でTLS対応
+* 🧾 永続化（DLQやin-flightをディスク保存）
+* 📊 モニタリング・ダッシュボード用Exporter（Prometheus形式など）
+
+どの機能を次に拡張したいですか？
+
