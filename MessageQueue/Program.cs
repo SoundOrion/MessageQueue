@@ -54,6 +54,39 @@ public static class Program
                     await cli.RunAsync(cts.Token);
                     break;
                 }
+            case "clientx":
+                {
+                    // 例: dotnet run -- clientx clientA 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002 [desiredTotalParallelism]
+                    if (args.Length < 4)
+                    {
+                        Console.WriteLine("Usage:");
+                        Console.WriteLine("  clientx <clientId> <host1:port1> <host2:port2> ... [desiredTotalParallelism]");
+                        return;
+                    }
+
+                    var clientId = args[1];
+
+                    // 末尾に整数があれば desiredTotal として解釈
+                    int desiredTotal = 4;
+                    int endpointCount = args.Length - 2;
+                    if (int.TryParse(args[^1], out var d))
+                    {
+                        desiredTotal = Math.Max(1, d);
+                        endpointCount = args.Length - 3;
+                    }
+
+                    var endpoints = new (string host, int port)[endpointCount];
+                    for (int i = 0; i < endpointCount; i++)
+                    {
+                        var hp = args[2 + i].Split(':', 2);
+                        endpoints[i] = (hp[0], int.Parse(hp[1]));
+                    }
+
+                    var cliX = new ClientMulti(clientId, endpoints, desiredTotal);
+                    await cliX.RunAsync(cts.Token);
+                    break;
+                }
+
         }
     }
 }
