@@ -1,0 +1,134 @@
+了解。変更は**いまのファイルでOK（追加の修正は不要）**です。そのうえで、**Leader.cs + ClusterNode.cs + Persistence.cs を統合して 3 ノード自動選挙を起動する最小 Main**を用意しました。これを `Program.cs` にそのまま置くと、単一プロセス内で 3 台分の Leader を並行起動します（ポート: 5000 / 5001 / 5002、グループ: g1）。
+
+```csharp
+// Program.cs
+using System;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using MessageQueue.Roll;
+
+class Program
+{
+    static async Task<int> Main(string[] args)
+    {
+        // 使い方:
+        //   dotnet run -- demo3
+        //     → 単一プロセスで 5000/5001/5002 の 3ノードを自動選挙モードで起動（Ctrl+C で終了）
+        //
+        //   dotnet run -- leader <port> [--role leader|follower|auto] [--leader host:port] [--group <id>] [--peers host1:port1,host2:port2]
+        //     → 単一ノード起動（従来動作 + Raft 自動選挙）
+
+        if (args.Length == 0)
+        {
+            Console.WriteLine("usage:");
+            Console.WriteLine("  dotnet run -- demo3");
+            Console.WriteLine("  dotnet run -- leader <port> [--role leader|follower|auto] [--leader host:port] [--group <id>] [--peers host:port,...]");
+            return 1;
+        }
+
+        if (args[0] == "demo3")
+        {
+            var groupId = "g1";
+            var p0 = 5000; var p1 = 5001; var p2 = 5002;
+
+            // peers 定義
+            var peers0 = new[] { $"127.0.0.1:{p1}", $"127.0.0.1:{p2}" };
+            var peers1 = new[] { $"127.0.0.1:{p0}", $"127.0.0.1:{p2}" };
+            var peers2 = new[] { $"127.0.0.1:{p0}", $"127.0.0.1:{p1}" };
+
+            // Leader を3台起動（role=auto → Raft 自動選挙）
+            var l0 = new Leader(p0, role: "auto", staticLeader: null, groupId: groupId, peers: peers0);
+            var l1 = new Leader(p1, role: "auto", staticLeader: null, groupId: groupId, peers: peers1);
+            var l2 = new Leader(p2, role: "auto", staticLeader: null, groupId: groupId, peers: peers2);
+
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+            Console.WriteLine("[demo3] starting 3-node cluster: 5000/5001/5002 (group=g1)");
+            var t0 = l0.RunAsync(cts.Token);
+            var t1 = l1.RunAsync(cts.Token);
+            var t2 = l2.RunAsync(cts.Token);
+
+            // 見やすいログヘッダ
+            _ = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    await Task.Delay(1000, cts.Token);
+                    // ここで役割のスナップショットを取る（必要なら Leader に公開メソッドを作って _raft.SnapshotRole() を覗く）
+                }
+            }, cts.Token);
+
+            await Task.WhenAll(Task.WhenAny(t0, t1, t2), Task.Run(() => { while (!cts.IsCancellationRequested) { } }));
+            Console.WriteLine("[demo3] stopping...");
+            return 0;
+        }
+
+        // 単一ノード起動（従来+拡張）
+        if (args[0] == "leader")
+        {
+            if (args.Length < 2) { Console.WriteLine("usage: leader <port> [--role ...] [--leader host:port] [--group id] [--peers host:port,...]"); return 1; }
+
+            var port = int.Parse(args[1]);
+            var role = "leader";
+            string? staticLeader = null;
+            string groupId = "default";
+            string[] peers = Array.Empty<string>();
+
+            for (int i = 2; i < args.Length; i++)
+            {
+                switch (args[i])
+                {
+                    case "--role"   when i + 1 < args.Length: role = args[++i]; break;
+                    case "--leader" when i + 1 < args.Length: staticLeader = args[++i]; break;
+                    case "--group"  when i + 1 < args.Length: groupId = args[++i]; break;
+                    case "--peers"  when i + 1 < args.Length: peers = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries); break;
+                }
+            }
+
+            var ld = new Leader(port, role, staticLeader, groupId, peers);
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+            await ld.RunAsync(cts.Token);
+            return 0;
+        }
+
+        Console.WriteLine("unknown command.");
+        return 1;
+    }
+}
+```
+
+### 使い方（起動例）
+
+* 3ノード同時起動（単一プロセス内）
+
+  ```
+  dotnet run -- demo3
+  ```
+
+  → 自動で 5000/5001/5002 が立ち上がり、Raft の選挙でどれかが Leader に昇格します。
+
+* 個別ノードで起動（別プロセス×3でもOK）
+
+  ```
+  # 1台目
+  dotnet run -- leader 5000 --role auto --group g1 --peers 127.0.0.1:5001,127.0.0.1:5002
+
+  # 2台目
+  dotnet run -- leader 5001 --role auto --group g1 --peers 127.0.0.1:5000,127.0.0.1:5002
+
+  # 3台目
+  dotnet run -- leader 5002 --role auto --group g1 --peers 127.0.0.1:5000,127.0.0.1:5001
+  ```
+
+### 動作チェックのヒント
+
+* **Phase 1** を見るなら、1～2台を `--role follower --leader 127.0.0.1:5000` で起動し、フォロワが `NotLeader` を返すことをクライアント/ワーカーで確認。
+* **Phase 2**（自動選挙）では上の `demo3` もしくは個別 3 プロセスで起動し、Leader を kill → Follower が昇格することを確認。
+
+> 備考：あなたの `Worker` は `HelloWorker` で接続し、`Credit` を返しながら `AssignJob` を処理→`AckJob` を返す流れになっています（手元の `Worker.cs` のままでOK）。この Main の上でもそのまま動作します。
+
+必要なら、**テスト用の超シンプルな Client（Submit → Result 受信）**と、**ダミーの exe 実行ファイル配置手順**もすぐ出せます。どう進めます？
