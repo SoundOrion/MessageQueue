@@ -25,6 +25,8 @@ public sealed class Leader
 
     private static readonly ThreadLocal<Random> _rng = new(() => new Random());
 
+    // Dead Letter Queue
+    private readonly ConcurrentQueue<JobEnvelope> _dlq = new();
 
     public Leader(int port)
     {
@@ -194,6 +196,47 @@ public sealed class Leader
     }
 
 
+    //private void CheckTimeouts()
+    //{
+    //    var now = DateTime.UtcNow;
+
+    //    foreach (var kv in _inflight.ToArray())
+    //    {
+    //        var inf = kv.Value;
+    //        if (now < inf.DueAt) continue; // まだ待つ
+
+    //        // 期限到達 → 取り除く
+    //        if (!_inflight.TryRemove(inf.Job.JobId, out _)) continue;
+
+    //        // 最大試行に達したら DLQ または再キュー
+    //        if (inf.Attempt >= MaxAttempts)
+    //        {
+    //            Console.WriteLine($"[Leader] Job {inf.Job.JobId} exceeded max attempts ({MaxAttempts}). Requeue/DLQ.");
+    //            _queue.Enqueue(inf.Job);            // ここを DLQ に変えることも可能
+    //            continue;
+    //        }
+
+    //        // 次の送信先（別Workerを優先）
+    //        WorkerConn? target;
+    //        lock (_lock)
+    //        {
+    //            target = _workers.Values
+    //                .Where(w => w.Credit > 0 && !ReferenceEquals(w, inf.Owner))
+    //                .OrderByDescending(w => w.Credit).ThenBy(w => w.Running)
+    //                .FirstOrDefault() ?? inf.Owner;
+    //        }
+
+    //        // 次のタイムアウト値（指数バックオフ + ジッタ）
+    //        var nextTimeout = NextTimeout(inf.Timeout);
+    //        var nextAttempt = inf.Attempt + 1;
+
+    //        Console.WriteLine($"[Leader] Retransmit {inf.Job.JobId} -> {target!.WorkerId} (try={nextAttempt}, timeout={nextTimeout.TotalMilliseconds:N0}ms)");
+    //        // 再送
+    //        SendAssign(target, inf.Job, nextAttempt);
+    //        // SendAssign 内で新しい timeout/due を設定します
+    //    }
+    //}
+
     private void CheckTimeouts()
     {
         var now = DateTime.UtcNow;
@@ -201,20 +244,20 @@ public sealed class Leader
         foreach (var kv in _inflight.ToArray())
         {
             var inf = kv.Value;
-            if (now < inf.DueAt) continue; // まだ待つ
+            if (now < inf.DueAt) continue; // まだACK待ち
 
-            // 期限到達 → 取り除く
-            if (!_inflight.TryRemove(inf.Job.JobId, out _)) continue;
+            if (!_inflight.TryRemove(inf.Job.JobId, out _))
+                continue;
 
-            // 最大試行に達したら DLQ または再キュー
+            // --- 🆕 DLQ分岐追加 ---
             if (inf.Attempt >= MaxAttempts)
             {
-                Console.WriteLine($"[Leader] Job {inf.Job.JobId} exceeded max attempts ({MaxAttempts}). Requeue/DLQ.");
-                _queue.Enqueue(inf.Job);            // ここを DLQ に変えることも可能
+                Console.WriteLine($"[Leader] Job {inf.Job.JobId} exceeded {MaxAttempts} attempts → DLQ");
+                _dlq.Enqueue(inf.Job);
                 continue;
             }
 
-            // 次の送信先（別Workerを優先）
+            // 再送（従来通り）
             WorkerConn? target;
             lock (_lock)
             {
@@ -224,14 +267,11 @@ public sealed class Leader
                     .FirstOrDefault() ?? inf.Owner;
             }
 
-            // 次のタイムアウト値（指数バックオフ + ジッタ）
             var nextTimeout = NextTimeout(inf.Timeout);
             var nextAttempt = inf.Attempt + 1;
 
             Console.WriteLine($"[Leader] Retransmit {inf.Job.JobId} -> {target!.WorkerId} (try={nextAttempt}, timeout={nextTimeout.TotalMilliseconds:N0}ms)");
-            // 再送
             SendAssign(target, inf.Job, nextAttempt);
-            // SendAssign 内で新しい timeout/due を設定します
         }
     }
 
@@ -281,4 +321,25 @@ public sealed class Leader
             Running = 0;
         }
     }
+
+    public void DumpDlq()
+    {
+        Console.WriteLine("==== Dead Letter Queue ====");
+        foreach (var j in _dlq)
+            Console.WriteLine($"Job {j.JobId}, size={j.Payload.Length} bytes");
+        Console.WriteLine("===========================");
+    }
+
+    public void RequeueDlq()
+    {
+        int count = 0;
+        while (_dlq.TryDequeue(out var job))
+        {
+            _queue.Enqueue(job);
+            count++;
+        }
+        Console.WriteLine($"[Leader] Requeued {count} jobs from DLQ.");
+    }
+
 }
+

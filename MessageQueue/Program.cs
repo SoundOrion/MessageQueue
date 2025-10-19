@@ -34,5 +34,17 @@ public static class Program
         Console.WriteLine("Press ENTER to stop...");
         Console.ReadLine();
         cts.Cancel();
+
+        Console.WriteLine("Press D=Dump DLQ, R=Requeue DLQ, or ENTER to stop");
+        while (true)
+        {
+            var key = Console.ReadKey(true).Key;
+            if (key == ConsoleKey.Enter) break;
+            if (key == ConsoleKey.D) leader.DumpDlq();
+            if (key == ConsoleKey.R) leader.RequeueDlq();
+        }
+        cts.Cancel();
+
     }
 }
+
