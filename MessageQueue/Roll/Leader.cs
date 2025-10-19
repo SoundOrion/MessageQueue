@@ -208,7 +208,7 @@ public sealed class Leader
                 case MsgType.AckJob:
                     if (_inflight.TryRemove(m.CorrId, out var inf))
                     {
-                        wc.Credit++;
+                        //wc.Credit++;
                         wc.Running--;
 
                         // Worker から結果が届いた場合は Client へ中継

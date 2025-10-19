@@ -1206,3 +1206,182 @@ Client                Leader                Worker
 💡「Workerの実行環境とファイル構成」
 などを図解付きでさらに詳しく説明することもできます。
 どの部分を深掘りしたいですか？
+
+
+
+これらのC#ファイル群は、**簡易的な分散ジョブキューシステム**（メッセージキュー型のジョブ実行環境）を構成しています。
+構成は大きく分けて「Leader（スケジューラ）」「Worker（実行ノード）」「Client（ジョブ送信者）」の3役です。
+それぞれのファイルの役割を日本語で詳しく解説します。
+
+---
+
+## 🧩 全体構成の概要
+
+```
+Client → Leader → Worker
+   ↑          ↓
+   └── Result ←
+```
+
+1. **Client**：ジョブを作成しLeaderに送信、結果を待つ
+2. **Leader**：ジョブをキューイングし、空きWorkerに割り当て、結果をClientへ返す
+3. **Worker**：ジョブを受け取り実行（exe起動）、結果をLeaderへ返す
+
+通信はすべてTCPで行い、独自の**バイナリフレームプロトコル**を使用しています。
+
+---
+
+## 🧱 `Codec.cs` ― メッセージのエンコード／デコード
+
+Leader・Client・Worker間の通信プロトコルを定義しています。
+
+* 1メッセージの構造は以下のようになっています：
+
+  ```
+  [len:4LE][type:1][msgId:16][corrId:16]
+  [subjectLen:2LE][subject:utf8]
+  [payloadLen:4LE][payload:..]
+  ```
+* `WriteAsync()`
+  `Message`オブジェクトをこの形式でバイト列にして`NetworkStream`へ送信。
+* `ReadAsync()`
+  ストリームから上記フォーマットの1メッセージを読み取り、`Message`に変換。
+
+→ **通信層の基礎部分**を担当しています。
+
+---
+
+## 🔁 `DedupCache.cs` ― 重複処理防止キャッシュ
+
+* `Guid`（ジョブIDなど）をキーに記録し、TTLを超えた古いものを削除。
+* `Worker`が同じジョブを再受信しても、二重実行しないようにします。
+
+---
+
+## ✉️ `Message.cs` ― メッセージ定義
+
+* 通信で使われるメッセージ種別（`MsgType`）を列挙：
+
+  * `SubmitJob`：Client→Leader
+  * `AssignJob`：Leader→Worker
+  * `AckJob`：Worker→Leader（完了通知）
+  * `Result`：Leader→Client（結果）
+  * `HelloClient`, `HelloWorker`：接続初期化
+* `Message`クラスには`MsgId`, `CorrId`, `Subject`, `Payload`を保持。
+
+---
+
+## 📦 `Models.cs` ― ジョブ関連データモデル
+
+ジョブの内容と結果を定義：
+
+* `JobRequest`：ジョブの要求（JobId, ExecName, 引数, 添付ファイル）
+* `JobResult`：実行結果（標準出力、エラー、zip成果物など）
+* `InputFile`：ジョブ入力ファイル。
+
+---
+
+## 🎯 `SubjectMatcher.cs` ― トピックパターンマッチ
+
+Workerが購読するジョブ種別を判定します。
+
+* パターン例：
+
+  * `"job.assign.*"` → すべてのジョブを受ける
+  * `"job.assign.calcA.*"` → calcA専用ジョブのみ
+* `"*"`・`">"`ワイルドカード対応。
+
+---
+
+## 👨‍💼 `Client.cs` ― ジョブ送信クライアント
+
+1. Leaderへ接続し、自分のClientIdを`HelloClient`で送信。
+2. `calcA`ジョブを3件送信（例示コード）。
+3. 結果(`Result`)を受け取り、内容をコンソール出力。
+
+→ 開発者・ユーザーが使う送信ツール。
+
+---
+
+## 🧠 `Leader.cs` ― 中央スケジューラ
+
+最も複雑で重要なクラスです。
+ジョブキュー管理・再送制御・Worker／Client接続管理を行います。
+
+### 主な機能
+
+* **Client接続処理**：`HelloClient`受信後にClientConn生成
+* **Worker接続処理**：`HelloWorker`受信後にWorkerConn生成
+* **ジョブキュー**：ExecName（例: calcA）ごとにキューを保持
+* **スケジューラ**：
+
+  * Workerの空きクレジット(`Credit`)に応じてジョブを割り当て
+  * ラウンドロビン方式で公平に配分
+* **再送処理**：
+
+  * Ack未受信のジョブを監視
+  * Exponential Backoff（指数バックオフ）+ ジッターで再送
+  * MaxAttempts超過はDLQ（デッドレターキュー）へ退避
+* **結果中継**：
+
+  * Worker→Leader→Client のResult伝達
+
+---
+
+## ⚙️ `Worker.cs` ― ジョブ実行ノード
+
+Leaderから受けたジョブを実際に実行します。
+
+### 動作の流れ
+
+1. `HelloWorker`送信しLeaderに登録。
+2. クレジット(`Credit`)を送って「空き1件あります」と伝える。
+3. `AssignJob`受信時：
+
+   * `DedupCache`で重複チェック
+   * `/opt/grid/exe/<ExecName>.exe` をコピーして実行
+   * 標準出力・エラーを取得
+   * 結果ファイルをZIP化して`AckJob`としてLeaderへ返送
+   * `Credit`を再送して次ジョブ受付可能に。
+
+→ **実ジョブの実行・完了通知担当**。
+
+---
+
+## 🚀 `Program.cs` ― エントリーポイント
+
+コマンドラインで3モード起動を切り替え：
+
+```bash
+dotnet run -- leader 5000
+dotnet run -- worker 127.0.0.1 5000 job.assign.*
+dotnet run -- client 127.0.0.1 5000 clientA
+```
+
+* Leaderモード：ポートを開き待受
+* Workerモード：指定Leaderへ接続して実行待ち
+* Clientモード：ジョブ送信＆結果受信。
+
+---
+
+## 🧾 まとめ
+
+| 役割      | 主なファイル                               | 機能概要                |
+| ------- | ------------------------------------ | ------------------- |
+| 通信層     | `Codec.cs`                           | メッセージシリアライズ/デシリアライズ |
+| モデル     | `Message.cs`, `Models.cs`            | メッセージ・ジョブ定義         |
+| ユーティリティ | `DedupCache.cs`, `SubjectMatcher.cs` | 重複除外・パターン判定         |
+| Client  | `Client.cs`                          | ジョブ送信＆結果受信          |
+| Leader  | `Leader.cs`                          | スケジューリング・再送・結果中継    |
+| Worker  | `Worker.cs`                          | 実行・Ack送信            |
+| 起動設定    | `Program.cs`                         | CLI起動モード切替          |
+
+---
+
+もし希望があれば、次のような解説資料も作れます：
+
+* 🧠 「Leader.cs」のスケジューリングアルゴリズム詳細図
+* 🔌 通信プロトコルのパケットフォーマット図
+* ⚙️ 「Worker」の実行ディレクトリ構成図
+
+どれを詳しく知りたいですか？
