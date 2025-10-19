@@ -1,0 +1,170 @@
+OK！`Leader.cs` で **Raft RPC（AppendEntries / RequestVote）** を受け付けて応答する最小ハンドラ雛形です。
+既存の `HandleConnAsync` の「最初の1メッセージ」を読んだ時点で、**クラスタRPCなら即処理して返答→接続を閉じる**、そうでなければ従来どおり `HelloClient` / `HelloWorker` のハンドシェイクに進む、という流れにします。
+
+> 前提：`Leader` に `_raft: ClusterNode?` があり、`role=auto` のとき初期化済み。
+> `Message.cs` に `AppendEntries / AppendResp / RequestVote / VoteResp` が追加済み。
+
+---
+
+## 1) 先頭に using を追加（未導入なら）
+
+```csharp
+using System.Text.Json;
+using MessageQueue.Common; // Message, Codec, MsgType
+```
+
+---
+
+## 2) Leader にクラスタRPCハンドラを追加
+
+```csharp
+// Leader.cs（クラス内のどこかに追加）
+private async Task<bool> TryHandleClusterRpcAsync(NetworkStream ns, Message first, CancellationToken ct)
+{
+    // Raftクラスタ無効なら処理しない
+    if (_raft is null) return false;
+
+    switch (first.Type)
+    {
+        case MsgType.AppendEntries:
+        {
+            var doc = JsonDocument.Parse(first.Payload);
+            var root = doc.RootElement;
+
+            // group が一致するか（任意）
+            if (root.TryGetProperty("group", out var g) && g.GetString() is string grp)
+            {
+                // グループを見て弾きたい場合はここでチェック（省略可）
+                // if (grp != _groupId) { /* ignore */ }
+            }
+
+            var term          = root.GetProperty("term").GetInt64();
+            var leader        = root.GetProperty("leader").GetString()!;
+            var prevLogIndex  = root.GetProperty("prevLogIndex").GetInt32();
+            var prevLogTerm   = root.GetProperty("prevLogTerm").GetInt64();
+            // entry は null or JsonElement
+            JsonElement? entryElem = null;
+            if (root.TryGetProperty("entry", out var e) && e.ValueKind != JsonValueKind.Null)
+                entryElem = e;
+            var leaderCommit  = root.GetProperty("leaderCommit").GetInt32();
+
+            var (ok, curTerm, matchIdx) = await _raft.OnAppendEntriesAsync(
+                term, leader, prevLogIndex, prevLogTerm, entryElem, leaderCommit, ct);
+
+            var resp = new
+            {
+                term = curTerm,
+                success = ok,
+                matchIndex = matchIdx
+            };
+            await Codec.WriteAsync(ns, new Message
+            {
+                Type = MsgType.AppendResp,
+                Payload = JsonSerializer.SerializeToUtf8Bytes(resp)
+            }, ct);
+
+            return true; // RPC処理完了 → 接続を閉じる
+        }
+
+        case MsgType.RequestVote:
+        {
+            var doc = JsonDocument.Parse(first.Payload);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("group", out var g) && g.GetString() is string grp)
+            {
+                // グループチェック（必要なら）
+            }
+
+            var term         = root.GetProperty("term").GetInt64();
+            var candidate    = root.GetProperty("candidate").GetString()!;
+            var lastLogIndex = root.GetProperty("lastLogIndex").GetInt32();
+            var lastLogTerm  = root.GetProperty("lastLogTerm").GetInt64();
+
+            var (granted, curTerm) = _raft.OnRequestVote(term, candidate, lastLogIndex, lastLogTerm);
+
+            var resp = new
+            {
+                term = curTerm,
+                granted
+            };
+            await Codec.WriteAsync(ns, new Message
+            {
+                Type = MsgType.VoteResp,
+                Payload = JsonSerializer.SerializeToUtf8Bytes(resp)
+            }, ct);
+
+            return true;
+        }
+    }
+
+    return false; // クラスタRPCではない
+}
+```
+
+---
+
+## 3) `HandleConnAsync` 冒頭で呼び出し
+
+`HandleConnAsync(TcpClient tcp, CancellationToken ct)` の **最初の `Codec.ReadAsync` 直後**に差し込みます。
+（以下は要点のみ。あなたのファイル構成に合わせて挿入してください。）
+
+```csharp
+private async Task HandleConnAsync(TcpClient tcp, CancellationToken ct)
+{
+    using var tcpLease = tcp;
+    using var ns = tcp.GetStream();
+
+    var first = await Codec.ReadAsync(ns, ct);
+    if (first is null) return;
+
+    // ここでクラスタRPCを先に処理
+    if (await TryHandleClusterRpcAsync(ns, first, ct))
+        return; // AppendEntries/RequestVote は応答を返して終了
+
+    // 以降は従来の Hello 分岐（Client / Worker）
+    var hello = first;
+    if (hello.Type == MsgType.HelloClient)
+    {
+        // ... 既存のクライアント処理 ...
+    }
+    else if (hello.Type == MsgType.HelloWorker)
+    {
+        // ... 既存のワーカー処理 ...
+    }
+    else
+    {
+        // 不明な最初のメッセージ
+        return;
+    }
+}
+```
+
+> これで、**Peer からの1ショットRPC接続**（AppendEntries/RequestVote）が来ても、
+> Leader プロセスはその場で処理・応答して接続を閉じます。
+> 既存の Client/Worker の握手には影響しません。
+
+---
+
+## 4) 動作の要点
+
+* **Leader（role=autoで当選）**
+
+  * イベント発生時：`_raft.AppendAndReplicateAsync(new WalXxx(...))`
+  * バックグラウンド心拍：`ClusterNode.Start()` により自動送信
+* **Follower**
+
+  * Peer からの `AppendEntries` を上記ハンドラで受けて `_raft.OnAppendEntriesAsync` を呼ぶ
+  * commit まで進んだ分は `OnCommittedAsync`（あなたが Leader に実装済みのコールバック）で適用
+
+---
+
+## 5) よくあるつまずき
+
+* `Message.cs` に **列挙子**（`AppendEntries / AppendResp / RequestVote / VoteResp`）が無い → 追加必須
+* `TryHandleClusterRpcAsync` は **`_raft` が null のとき false を返す**（Phase 1 との両立）
+* `entry` の JSON は **`JsonElement`** のまま渡す（`ClusterNode` 側で WAL record へ復元）
+
+---
+
+必要なら、**`Leader` における `OnCommittedAsync(object entry)` の完全版**（`WalEnqueue/WalAssign/...`ごとの適用実装）もあわせて出します。
