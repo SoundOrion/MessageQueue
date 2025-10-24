@@ -1,0 +1,135 @@
+いい質問です！💪
+Windowsサービスを「**コマンドライン（cmd）だけ**で登録」するには、
+標準の **`sc.exe`** または **`powershell New-Service`** を使います。
+
+---
+
+## ✅ ① CMD（scコマンド）でサービス登録する方法
+
+基本構文：
+
+```cmd
+sc create <サービス名> binPath= "<exeのフルパス>" start= auto
+```
+
+### 例：
+
+```cmd
+cmd /c "sc create MyService binPath= \"C:\Program Files\MyApp\MyApp.exe\" start= auto"
+```
+
+📘 オプション解説：
+
+| オプション       | 説明                                    |
+| ----------- | ------------------------------------- |
+| `create`    | 新しいサービスを登録                            |
+| `MyService` | サービス名（任意の名前）                          |
+| `binPath=`  | 実行ファイルのフルパス（`=` の後に**スペース必須！**）       |
+| `start=`    | 起動タイプ（`auto` / `demand` / `disabled`） |
+
+💡注意：
+`binPath=` の直後に**必ずスペースが必要**です。
+これを忘れると「エラー 87: パラメーターが正しくありません」と出ます。
+
+---
+
+### サービスの説明・表示名を追加する場合
+
+```cmd
+cmd /c "sc create MyService binPath= \"C:\Program Files\MyApp\MyApp.exe\" start= auto DisplayName= \"My Custom Service\""
+```
+
+---
+
+### 登録後に説明文を設定
+
+```cmd
+cmd /c "sc description MyService \"My background worker service\""
+```
+
+---
+
+### サービス起動
+
+```cmd
+cmd /c "net start MyService"
+```
+
+### サービス停止
+
+```cmd
+cmd /c "net stop MyService"
+```
+
+### サービス削除
+
+```cmd
+cmd /c "sc delete MyService"
+```
+
+---
+
+## ✅ ② PowerShell で登録する場合（cmd /c 経由OK）
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"New-Service -Name 'MyService' -BinaryPathName 'C:\Program Files\MyApp\MyApp.exe' -DisplayName 'My Custom Service' -StartupType Automatic\""
+```
+
+📘
+
+* `-StartupType Automatic` → 自動起動
+* `New-Service` は PowerShell 標準コマンドレットです
+
+---
+
+## ✅ ③ C# の `ProcessStartInfo` から登録する場合
+
+```csharp
+var psi = new ProcessStartInfo
+{
+    FileName = Environment.GetEnvironmentVariable("ComSpec"),
+    Arguments = "/c sc create MyService binPath= \"C:\\Program Files\\MyApp\\MyApp.exe\" start= auto",
+    UseShellExecute = false,
+    RedirectStandardOutput = true,
+    RedirectStandardError = true,
+    CreateNoWindow = true
+};
+```
+
+---
+
+## ✅ ④ 既存サービスの状態確認
+
+```cmd
+cmd /c "sc query MyService"
+```
+
+---
+
+## ✅ ⑤ 登録後にトラブルがある場合
+
+* 実行アカウントが「ローカルシステム」になります
+  → ユーザーアカウントで動かしたい場合は次のようにします：
+
+```cmd
+sc config MyService obj= ".\MyUser" password= "MyPassword"
+```
+
+---
+
+## 🔧 まとめ
+
+| 操作   | コマンド                                                          |
+| ---- | ------------------------------------------------------------- |
+| 登録   | `sc create MyService binPath= "C:\App\MyApp.exe" start= auto` |
+| 起動   | `net start MyService`                                         |
+| 停止   | `net stop MyService`                                          |
+| 削除   | `sc delete MyService`                                         |
+| 状態確認 | `sc query MyService`                                          |
+
+---
+
+💬
+もしこのサービスを「ユーザー権限で実行」や「引数付きで登録」したいなら、
+そのパターン（`binPath` に引数追加、`obj=` で実行ユーザー指定）も書けます。
+どちらに近いケースですか？
