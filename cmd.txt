@@ -290,3 +290,122 @@ Created
 PowerShell版のほうがフォルダごと・読み取り専用・隠し属性も含め安全に動きます。
 
 どちらのバージョン（CMD or PowerShell）を採用しますか？
+
+あ、なるほど！✨
+つまりこうですね👇
+
+> ✅ パターン①：「存在チェックしてなければ**作る**」
+> ✅ パターン②：「存在チェックしてあれば**消す**」
+
+どちらも `cmd /c` で単体実行できるようにしたい、ということですね。
+完璧です。以下の2文で整理します。
+
+---
+
+## ✅ ① 存在チェックしてなければ生成（ファイル／フォルダ）
+
+### 🧩 ファイル版
+
+```cmd
+cmd /c "if not exist C:\Temp\test.txt (type nul > C:\Temp\test.txt)"
+```
+
+📘 説明：
+
+* `if not exist` → 存在しないときのみ実行
+* `type nul > file` → 空ファイル作成
+
+C#の `ProcessStartInfo` なら：
+
+```csharp
+Arguments = "/c if not exist \"C:\\Temp\\test.txt\" (type nul > \"C:\\Temp\\test.txt\")";
+```
+
+---
+
+### 🧩 フォルダ版
+
+```cmd
+cmd /c "if not exist C:\Temp\MyFolder (mkdir C:\Temp\MyFolder)"
+```
+
+📘 存在しない場合のみ `mkdir` 実行。
+C#なら：
+
+```csharp
+Arguments = "/c if not exist \"C:\\Temp\\MyFolder\" (mkdir \"C:\\Temp\\MyFolder\")";
+```
+
+---
+
+## ✅ ② 存在チェックしてあれば削除（ファイル／フォルダ）
+
+### 🧩 ファイル版
+
+```cmd
+cmd /c "if exist C:\Temp\test.txt (del /q C:\Temp\test.txt)"
+```
+
+📘
+
+* `if exist` → 存在する場合のみ実行
+* `/q` → 確認なし（quiet）
+
+C#用：
+
+```csharp
+Arguments = "/c if exist \"C:\\Temp\\test.txt\" (del /q \"C:\\Temp\\test.txt\")";
+```
+
+---
+
+### 🧩 フォルダ版（中身も含め削除）
+
+```cmd
+cmd /c "if exist C:\Temp\MyFolder (rd /s /q C:\Temp\MyFolder)"
+```
+
+📘
+
+* `/s` … サブフォルダ・ファイル含め削除
+* `/q` … 確認なし
+
+C#版：
+
+```csharp
+Arguments = "/c if exist \"C:\\Temp\\MyFolder\" (rd /s /q \"C:\\Temp\\MyFolder\")";
+```
+
+---
+
+## ✅ 💡 オプション（実行ログ付き）
+
+削除 or 作成が実際に行われたかを表示したい場合：
+
+```cmd
+cmd /c "if not exist C:\Temp\test.txt (type nul > C:\Temp\test.txt & echo Created)"
+```
+
+```cmd
+cmd /c "if exist C:\Temp\test.txt (del /q C:\Temp\test.txt & echo Deleted)"
+```
+
+---
+
+## ✅ まとめ
+
+| 目的            | コマンド例                                                   |
+| ------------- | ------------------------------------------------------- |
+| 存在しなければファイル作成 | `if not exist C:\Temp\a.txt (type nul > C:\Temp\a.txt)` |
+| 存在しなければフォルダ作成 | `if not exist C:\Temp\MyDir (mkdir C:\Temp\MyDir)`      |
+| 存在すればファイル削除   | `if exist C:\Temp\a.txt (del /q C:\Temp\a.txt)`         |
+| 存在すればフォルダ削除   | `if exist C:\Temp\MyDir (rd /s /q C:\Temp\MyDir)`       |
+
+---
+
+💬
+これで「存在すれば削除」「存在しなければ作成」の両方を、
+C# の `ProcessStartInfo` からシンプルに呼べます。
+
+どちらを多用しますか？（ファイル中心 or フォルダ中心）
+→ それに合わせて「共通化スクリプト風」に整理もできます。
