@@ -1,0 +1,544 @@
+はい！👋
+Windowsの **タスクスケジューラの一覧**（登録済みタスク）を表示する方法はいくつかあります。
+コマンドライン・PowerShell・C# の3パターンで紹介します。
+
+---
+
+## ✅ ① CMD コマンドで一覧を出す
+
+### 全タスク一覧
+
+```cmd
+schtasks /query /fo LIST /v
+```
+
+* `/query` … 一覧を表示
+* `/fo LIST` … 表示形式（LIST, TABLE, CSV など選べる）
+* `/v` … 詳細表示（スケジュール・最終実行結果など）
+
+例：テーブル形式で簡潔に見るなら
+
+```cmd
+schtasks /query /fo TABLE
+```
+
+---
+
+### 特定フォルダ（例：Microsoft 配下）だけ見る
+
+```cmd
+schtasks /query /tn "\Microsoft\Windows\Defrag"
+```
+
+---
+
+### XML出力したい場合
+
+```cmd
+schtasks /query /xml ONE > task.xml
+```
+
+---
+
+## ✅ ② PowerShell 版（柔軟＆フィルタ可能）
+
+```powershell
+Get-ScheduledTask | Select-Object TaskName, TaskPath, State, LastRunTime, NextRunTime
+```
+
+出力例：
+
+```
+TaskName       TaskPath                      State   LastRunTime           NextRunTime
+---------       --------                      -----   -----------           ------------
+GoogleUpdateTaskMachineUA \                  Ready   2025/10/24 10:00:00   2025/10/24 22:00:00
+MyBackupScript             \MyTasks\          Running 2025/10/24 03:00:00   2025/10/25 03:00:00
+```
+
+---
+
+### 特定の名前で絞り込み
+
+```powershell
+Get-ScheduledTask | Where-Object {$_.TaskName -like '*Backup*'}
+```
+
+---
+
+### C# の `ProcessStartInfo` から呼び出す場合
+
+```csharp
+var psi = new ProcessStartInfo
+{
+    FileName = Environment.GetEnvironmentVariable("ComSpec"),
+    Arguments = "/c schtasks /query /fo TABLE /v",
+    UseShellExecute = false,
+    RedirectStandardOutput = true,
+    CreateNoWindow = true
+};
+
+using var p = Process.Start(psi);
+string output = p.StandardOutput.ReadToEnd();
+p.WaitForExit();
+
+Console.WriteLine(output);
+```
+
+---
+
+## ✅ ③ PowerShell の結果をCSV形式で出力したいなら
+
+```powershell
+Get-ScheduledTask |
+Select-Object TaskName, TaskPath, State, LastRunTime, NextRunTime |
+Export-Csv "C:\Temp\Tasks.csv" -NoTypeInformation -Encoding UTF8
+```
+
+---
+
+## 🧩 一覧取得に関する補足
+
+* 一部タスク（特に `\Microsoft\Windows\` 以下）は **管理者権限が必要** です。
+* サービスアカウントで動いている場合、アクセスできるタスクは制限されることがあります。
+* `schtasks /query` は古いWindowsでも使えますが、`Get-ScheduledTask` は Windows 8 / Server 2012 以降で利用可能です。
+
+---
+
+💬 どの形式で一覧を取りたいですか？
+
+* ✅ 画面に出力（cmd）
+* 🧾 CSVファイル出力
+* 🧠 C#の中で配列として処理（結果をパース）
+
+伝わります 😊
+つまり「Windows タスクスケジューラに登録されている **“ユーザーが自分で設定したタスク”だけ**（システム標準タスクを除く）」を一覧したい、ということですね。
+
+---
+
+## ✅ 結論：ある程度は**絞り込み可能**です（完全ではない）
+
+Windowsには「ユーザー作成タスク」という明確なタグがないため、
+**ユーザーが登録したタスクらしきものを推定して抽出**する形になります。
+
+---
+
+## ✅ 方法①：PowerShellでユーザー登録タスクを抽出
+
+```powershell
+Get-ScheduledTask |
+Where-Object {
+    $_.TaskPath -notlike "\Microsoft*" -and
+    $_.TaskPath -notlike "\Windows*" -and
+    $_.TaskPath -notlike "\*" -and
+    $_.Principal.UserId -ne $null
+} |
+Select-Object TaskName, TaskPath, State, @{Name="User";Expression={$_.Principal.UserId}}
+```
+
+### 💡ポイント
+
+* `TaskPath -notlike "\Microsoft*"` で、Windows標準タスクを除外
+* `Principal.UserId` が設定されているタスク（ユーザー実行）だけ残す
+* 出力例：
+
+```
+TaskName     TaskPath      State   User
+---------     --------      -----   ----
+MyBackup      \             Ready   DESKTOP-ABC\User
+AppUpdater    \CustomTasks\ Ready   DESKTOP-ABC\User
+```
+
+---
+
+## ✅ 方法②：schtasksコマンドで抽出（CMDでも使える）
+
+```cmd
+schtasks /query /fo LIST /v | findstr /V "Microsoft\Windows"
+```
+
+* `/v` は詳細表示（ユーザー名も含まれる）
+* `findstr /V "Microsoft\Windows"` でシステムタスクを除外
+* ただし完全には除外できず、\Microsoft配下以外にもシステムタスクが混ざることがあります
+
+---
+
+## ✅ 方法③：確実に“自分のユーザー”が設定したものを抽出
+
+（ユーザー名で絞る）
+
+PowerShell例：
+
+```powershell
+$user = "$env:COMPUTERNAME\$env:USERNAME"
+Get-ScheduledTask | Where-Object { $_.Principal.UserId -eq $user } |
+Select-Object TaskName, TaskPath, State
+```
+
+💡 これなら「自分のWindowsアカウントで登録したタスク」だけ出ます。
+
+---
+
+## ✅ C# から呼び出す例
+
+```csharp
+var psi = new ProcessStartInfo
+{
+    FileName = Environment.GetEnvironmentVariable("ComSpec"),
+    Arguments = "/c powershell -NoProfile -Command \"Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\\Microsoft*' -and $_.Principal.UserId -ne $null } | Select-Object TaskName,TaskPath,State,@{Name='User';Expression={$_.Principal.UserId}}\"",
+    UseShellExecute = false,
+    RedirectStandardOutput = true,
+    CreateNoWindow = true
+};
+```
+
+---
+
+## ✅ まとめ
+
+| 方法             | コマンド                         | 特徴                                                      |                |
+| -------------- | ---------------------------- | ------------------------------------------------------- | -------------- |
+| PowerShell（推奨） | `Get-ScheduledTask           | Where-Object { $_.TaskPath -notlike '\Microsoft*' }`    | システムタスク除外に最適   |
+| CMD            | `schtasks /query /fo LIST /v | findstr /V Microsoft\Windows`                           | どのWindowsでも使える |
+| 特定ユーザー         | `Get-ScheduledTask           | Where-Object { $_.Principal.UserId -eq $env:USERNAME }` | 自分が作ったものだけ     |
+
+---
+
+もし「現在ログインしているユーザーが作ったタスクだけ」や
+「特定のユーザー（例：Administrator）のタスクだけ」
+に絞りたい場合、PowerShell版が最も確実です。
+
+---
+
+必要ならその一覧を **CSV** や **JSON** に出力するスクリプトも書けます。
+出力形式はどうしたいですか？（例：CSV, テーブル, 標準出力）
+
+OKです！💪
+「PowerShellやschtasksを全部 `cmd /c` から呼び出したい」場合の実用コマンドをまとめました。
+全部 **1 行で実行可能** です。
+
+---
+
+## ✅ 1️⃣ 「すべてのタスク」を一覧（詳細含む）
+
+```cmd
+cmd /c "schtasks /query /fo TABLE /v"
+```
+
+📝
+
+* `/fo TABLE` → 表形式
+* `/v` → 詳細（実行ユーザー・状態など）
+
+---
+
+## ✅ 2️⃣ 「ユーザーが作成したタスク」だけ抽出（システム系を除外）
+
+```cmd
+cmd /c "schtasks /query /fo TABLE /v | findstr /I /V \"Microsoft\\Windows\""
+```
+
+📘
+
+* `findstr /V` → 指定文字列を含まない行を表示（つまり \Microsoft\Windows 配下を除外）
+* `/I` → 大文字小文字無視
+
+---
+
+## ✅ 3️⃣ 「現在のログインユーザーが登録したタスク」だけ表示
+
+```cmd
+cmd /c "for /f \"tokens=*\" %u in ('echo %USERNAME%') do schtasks /query /fo TABLE /v | findstr /I /C:\"%u\""
+```
+
+🧠
+
+* `echo %USERNAME%` で現在ログインしているユーザー名を取得
+* そのユーザー名を含むタスクを `findstr` で抽出
+
+---
+
+## ✅ 4️⃣ より正確な方法（PowerShell経由）
+
+CMD 1行から PowerShell を叩いて、
+「Microsoft配下を除外」「ユーザーIDあり」に絞る例👇
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\\Microsoft*' -and $_.Principal.UserId -ne $null } | Select-Object TaskName,TaskPath,State,@{Name='User';Expression={$_.Principal.UserId}} | Format-Table -AutoSize\""
+```
+
+💡
+
+* CMD上で完結して呼べます
+* PowerShell 内部で `Where-Object` を使い細かく絞り込み
+* 出力は整った表形式
+
+---
+
+## ✅ 5️⃣ 結果をCSVに出したい場合
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\\Microsoft*' } | Select TaskName,TaskPath,State,@{Name='User';Expression={$_.Principal.UserId}} | Export-Csv 'C:\Temp\Tasks.csv' -NoTypeInformation -Encoding UTF8\""
+```
+
+→ `C:\Temp\Tasks.csv` に出力されます。
+
+---
+
+## ✅ 6️⃣ C# の `ProcessStartInfo` で呼ぶ場合（例）
+
+```csharp
+var psi = new ProcessStartInfo
+{
+    FileName = Environment.GetEnvironmentVariable("ComSpec"),
+    Arguments = "/c powershell -NoProfile -Command \"Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\\Microsoft*' -and $_.Principal.UserId -ne $null } | Select TaskName,TaskPath,State,@{Name='User';Expression={$_.Principal.UserId}} | Format-Table -AutoSize\"",
+    UseShellExecute = false,
+    RedirectStandardOutput = true,
+    CreateNoWindow = true
+};
+```
+
+---
+
+⚙️ まとめ
+
+| 目的      | コマンド                                    |                               |
+| ------- | --------------------------------------- | ----------------------------- |
+| すべてのタスク | `schtasks /query /fo TABLE /v`          |                               |
+| システム除外  | `schtasks /query /fo TABLE /v           | findstr /V Microsoft\Windows` |
+| 現ユーザーだけ | `schtasks /query /fo TABLE /v           | findstr /I "%USERNAME%"`      |
+| 正確な絞り込み | `powershell -Command "Get-ScheduledTask | Where-Object {...}"`          |
+| CSV出力   | `powershell -Command "Get-ScheduledTask | Export-Csv ..."`              |
+
+---
+
+どの形式で出力したいですか？
+たとえば 「C# から呼んで結果をパースしたい」 や 「CSVに保存したい」 など目的に合わせて最適化できます。
+
+めっちゃ良い流れです👍
+つまり今度は「**cmd /c から特定のタスクを削除したい**」ですね。
+できます！ — `schtasks /delete` コマンドを使います。
+
+---
+
+## ✅ 基本構文（cmd 版）
+
+```cmd
+cmd /c "schtasks /delete /tn \"タスク名\" /f"
+```
+
+### 🧠 説明
+
+| オプション     | 意味               |
+| --------- | ---------------- |
+| `/delete` | タスク削除            |
+| `/tn`     | タスクの名前（TaskName） |
+| `/f`      | 確認なし（Force）      |
+
+---
+
+### 🔹 例：
+
+「MyTask」というタスクを削除する場合
+
+```cmd
+cmd /c "schtasks /delete /tn \"MyTask\" /f"
+```
+
+---
+
+### 🔹 サブフォルダ配下のタスクを削除したい場合
+
+（例：`\MyApp\AutoBackup`）
+
+```cmd
+cmd /c "schtasks /delete /tn \"\MyApp\AutoBackup\" /f"
+```
+
+> 💡 パス指定の先頭に `\` が必要です（ルート基準で）
+> 例： `\Microsoft\Windows\Defrag` のように。
+
+---
+
+## ✅ PowerShell 経由でも削除できる（柔軟版）
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"Unregister-ScheduledTask -TaskName 'MyTask' -Confirm:$false\""
+```
+
+またはフォルダ配下指定なら：
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"Unregister-ScheduledTask -TaskPath '\\MyApp\\' -TaskName 'AutoBackup' -Confirm:$false\""
+```
+
+💡 `Unregister-ScheduledTask` は PowerShell版の削除コマンドです。
+`schtasks` よりもオブジェクト的で、ユーザー権限やエラーも明確に取れます。
+
+---
+
+## ✅ C# から `ProcessStartInfo` で呼ぶ場合
+
+```csharp
+var psi = new ProcessStartInfo
+{
+    FileName = Environment.GetEnvironmentVariable("ComSpec"),
+    Arguments = "/c schtasks /delete /tn \"MyTask\" /f",
+    UseShellExecute = false,
+    RedirectStandardOutput = true,
+    RedirectStandardError = true,
+    CreateNoWindow = true
+};
+
+using var p = Process.Start(psi);
+string stdout = p.StandardOutput.ReadToEnd();
+string stderr = p.StandardError.ReadToEnd();
+p.WaitForExit();
+
+Console.WriteLine("STDOUT: " + stdout);
+Console.WriteLine("STDERR: " + stderr);
+```
+
+---
+
+## ✅ 確認付きにしたい場合（安全削除）
+
+確認プロンプトを出すには `/f` を外すだけです：
+
+```cmd
+cmd /c "schtasks /delete /tn \"MyTask\""
+```
+
+すると
+
+```
+警告: タスク "MyTask" を削除しますか (Y/N)?
+```
+
+と聞かれます。
+
+---
+
+## ✅ まとめ
+
+| 操作          | コマンド例                                                         | 備考     |
+| ----------- | ------------------------------------------------------------- | ------ |
+| タスク削除（強制）   | `schtasks /delete /tn "MyTask" /f`                            | 最もシンプル |
+| サブフォルダ指定    | `schtasks /delete /tn "\MyApp\Backup" /f`                     | パス必須   |
+| PowerShell版 | `Unregister-ScheduledTask -TaskName 'MyTask' -Confirm:$false` | 柔軟     |
+| 確認付き        | `/f` を外す                                                      | 安全操作向け |
+
+---
+
+💬
+もし「一覧で出したタスクを順に削除したい」や「特定条件（例：UserIdが自分）」のタスクだけ消したいなら、
+PowerShellを `cmd /c` 経由で組み合わせて一括削除することもできます。
+
+希望します？（例：「自分の作ったタスクだけ全部削除」）
+
+完璧です 💪
+「**現在ログインしているユーザーが登録したタスクだけ削除**」したい — つまり、
+Windows標準タスク（Microsoft配下など）は残して、**自分が作ったタスクだけ全部消す**ですね。
+
+これ、PowerShellを `cmd /c` 経由で実行すれば **1行で安全に実現できます。**
+
+---
+
+## ✅ 1️⃣ 現在のユーザーのタスクだけ削除（確認なし）
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"$me=$env:USERNAME; Get-ScheduledTask | Where-Object { $_.Principal.UserId -match $me -and $_.TaskPath -notlike '\\Microsoft*' } | ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath -Confirm:$false }\""
+```
+
+---
+
+### 💡このコマンドがやっていること
+
+| 処理内容                                              | 説明                |
+| ------------------------------------------------- | ----------------- |
+| `$me=$env:USERNAME`                               | 現在ログイン中のユーザー名を取得  |
+| `Get-ScheduledTask`                               | 全タスクを取得           |
+| `Where-Object { $_.Principal.UserId -match $me }` | ユーザー名に一致するタスクだけ残す |
+| `-and $_.TaskPath -notlike '\Microsoft*'`         | Microsoft標準タスクは除外 |
+| `Unregister-ScheduledTask -Confirm:$false`        | 確認なしで削除           |
+
+---
+
+### 🧩 出力例（参考）
+
+削除対象があると：
+
+```
+Unregister-ScheduledTask : タスク 'MyBackup' が削除されました。
+Unregister-ScheduledTask : タスク 'DailyReport' が削除されました。
+```
+
+削除対象がなければ何も表示されません。
+
+---
+
+## ✅ 2️⃣ 「対象ユーザーを指定して削除」したい場合（例: Administrator）
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"$target='Administrator'; Get-ScheduledTask | Where-Object { $_.Principal.UserId -match $target -and $_.TaskPath -notlike '\\Microsoft*' } | ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath -Confirm:$false }\""
+```
+
+---
+
+## ✅ 3️⃣ 確認ありで安全に削除したい場合
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"$me=$env:USERNAME; Get-ScheduledTask | Where-Object { $_.Principal.UserId -match $me -and $_.TaskPath -notlike '\\Microsoft*' } | ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath }\""
+```
+
+🟡 → この場合、削除ごとに
+
+```
+確認: タスク 'MyBackup' を削除しますか? [Y] はい [N] いいえ
+```
+
+のようにプロンプトが出ます。
+
+---
+
+## ✅ 4️⃣ C# `ProcessStartInfo` に組み込む例
+
+```csharp
+var psi = new ProcessStartInfo
+{
+    FileName = Environment.GetEnvironmentVariable("ComSpec"),
+    Arguments = "/c powershell -NoProfile -Command \"$me=$env:USERNAME; Get-ScheduledTask | Where-Object { $_.Principal.UserId -match $me -and $_.TaskPath -notlike '\\Microsoft*' } | ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath -Confirm:$false }\"",
+    UseShellExecute = false,
+    RedirectStandardOutput = true,
+    RedirectStandardError = true,
+    CreateNoWindow = true
+};
+```
+
+---
+
+## ✅ 5️⃣ 削除前に一覧を出して確認したい場合
+
+```cmd
+cmd /c "powershell -NoProfile -Command \"$me=$env:USERNAME; Get-ScheduledTask | Where-Object { $_.Principal.UserId -match $me -and $_.TaskPath -notlike '\\Microsoft*' } | Select-Object TaskName,TaskPath,State\""
+```
+
+---
+
+## ✅ まとめ
+
+| 目的           | コマンド                                                                          |
+| ------------ | ----------------------------------------------------------------------------- |
+| 自分のタスクを削除    | `/c powershell -Command "... $env:USERNAME ... Unregister-ScheduledTask ..."` |
+| 特定ユーザーのタスク削除 | `$target='UserName'` に置換                                                      |
+| 確認あり         | `-Confirm:$false` を削除                                                         |
+| 削除前に一覧確認     | `Select-Object TaskName,TaskPath`                                             |
+
+---
+
+💡 **おすすめ運用**
+1️⃣ まず一覧表示で「対象」確認
+2️⃣ 問題なければ `/Confirm:$false` 付きで削除
+
+---
+
+必要なら「特定フォルダ配下（例：`\MyApp\`）」だけ消す版も出せます。出しますか？
