@@ -409,3 +409,102 @@ C# の `ProcessStartInfo` からシンプルに呼べます。
 
 どちらを多用しますか？（ファイル中心 or フォルダ中心）
 → それに合わせて「共通化スクリプト風」に整理もできます。
+
+PowerShell ならもっとシンプルに書けます 💡
+以下のように **ファイル／フォルダの存在チェックと削除・作成** を分けて書けます。
+もちろん、どちらも `cmd /c powershell -NoProfile -Command "..."` の1行で実行可能です。
+
+---
+
+## ✅ ① 存在チェックしてなければ作成
+
+### ファイルの場合
+
+```cmd
+cmd /c powershell -NoProfile -Command "if (-not (Test-Path 'C:\Temp\test.txt')) { New-Item -Path 'C:\Temp\test.txt' -ItemType File | Out-Null }"
+```
+
+### フォルダの場合
+
+```cmd
+cmd /c powershell -NoProfile -Command "if (-not (Test-Path 'C:\Temp\MyFolder')) { New-Item -Path 'C:\Temp\MyFolder' -ItemType Directory | Out-Null }"
+```
+
+📘 `-not (Test-Path …)` で存在しないときのみ作成します。
+`| Out-Null` は画面出力を抑制するための省略用です。
+
+---
+
+## ✅ ② 存在チェックしてあれば削除
+
+### ファイルの場合
+
+```cmd
+cmd /c powershell -NoProfile -Command "if (Test-Path 'C:\Temp\test.txt') { Remove-Item 'C:\Temp\test.txt' -Force }"
+```
+
+### フォルダ（中身ごと削除）の場合
+
+```cmd
+cmd /c powershell -NoProfile -Command "if (Test-Path 'C:\Temp\MyFolder') { Remove-Item 'C:\Temp\MyFolder' -Recurse -Force }"
+```
+
+📘
+
+* `Test-Path` … 存在チェック
+* `Remove-Item` … 削除コマンド
+* `-Recurse` … サブフォルダも含め削除
+* `-Force` … 読み取り専用や隠し属性も削除
+
+---
+
+## ✅ ③ 実行ログ付きにしたい場合
+
+```cmd
+cmd /c powershell -NoProfile -Command "if (Test-Path 'C:\Temp\test.txt') { Remove-Item 'C:\Temp\test.txt' -Force; Write-Host 'Deleted' } else { New-Item 'C:\Temp\test.txt' -ItemType File | Out-Null; Write-Host 'Created' }"
+```
+
+📘
+これで「存在すれば削除」「存在しなければ作成」を一括で行えます。
+出力例：
+
+```
+Created
+```
+
+または
+
+```
+Deleted
+```
+
+---
+
+## ✅ C# の `ProcessStartInfo` で呼ぶ場合（例）
+
+```csharp
+var psi = new ProcessStartInfo
+{
+    FileName = Environment.GetEnvironmentVariable("ComSpec"),
+    Arguments = "/c powershell -NoProfile -Command \"if (Test-Path 'C:\\Temp\\test.txt') { Remove-Item 'C:\\Temp\\test.txt' -Force; Write-Host 'Deleted' } else { New-Item 'C:\\Temp\\test.txt' -ItemType File | Out-Null; Write-Host 'Created' }\"",
+    UseShellExecute = false,
+    RedirectStandardOutput = true,
+    RedirectStandardError = true,
+    CreateNoWindow = true
+};
+```
+
+---
+
+💡 **まとめ**
+
+| 操作        | PowerShell コマンド                                            |
+| --------- | ---------------------------------------------------------- |
+| 存在しなければ作成 | `if (-not (Test-Path 'path')) { New-Item -ItemType File }` |
+| 存在すれば削除   | `if (Test-Path 'path') { Remove-Item -Force }`             |
+| 両方（トグル動作） | 上の `if` / `else` 組み合わせ                                     |
+
+---
+
+必要なら「フォルダもファイルも同時に判定する」万能バージョンも書けます（`Test-Path -PathType Any`）。
+出しますか？
